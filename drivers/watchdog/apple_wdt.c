@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/watchdog.h>
 
 /*
@@ -154,11 +155,27 @@ static const struct watchdog_info apple_wdt_info = {
 	.options = WDIOF_MAGICCLOSE | WDIOF_KEEPALIVEPING | WDIOF_SETTIMEOUT,
 };
 
+/*
+ * Match data of the T8140 (J700) and T8152 (J873) watchdogs: link the class
+ * device to its platform device and report probe failures and the reference
+ * clock rate. The other SoCs keep the silent probe and the unparented class
+ * device.
+ */
+static const bool apple_wdt_report = true;
+
+static int apple_wdt_probe_err(struct device *dev, bool report, int err,
+			       const char *msg)
+{
+	return report ? dev_err_probe(dev, err, "%s\n", msg) : err;
+}
+
 static int apple_wdt_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	bool report = device_get_match_data(dev);
 	struct apple_wdt *wdt;
 	struct clk *clk;
+	int ret;
 	u32 wdt_ctrl;
 
 	wdt = devm_kzalloc(dev, sizeof(*wdt), GFP_KERNEL);
@@ -167,17 +184,22 @@ static int apple_wdt_probe(struct platform_device *pdev)
 
 	wdt->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(wdt->regs))
-		return PTR_ERR(wdt->regs);
+		return apple_wdt_probe_err(dev, report, PTR_ERR(wdt->regs),
+					   "failed to map watchdog registers");
 
 	clk = devm_clk_get_enabled(dev, NULL);
 	if (IS_ERR(clk))
-		return PTR_ERR(clk);
+		return apple_wdt_probe_err(dev, report, PTR_ERR(clk),
+					   "failed to enable reference clock");
 	wdt->clk_rate = clk_get_rate(clk);
 	if (!wdt->clk_rate)
-		return -EINVAL;
+		return apple_wdt_probe_err(dev, report, -EINVAL,
+					   "reference clock rate is zero");
 
 	platform_set_drvdata(pdev, wdt);
 
+	if (report)
+		wdt->wdd.parent = dev;
 	wdt->wdd.ops = &apple_wdt_ops;
 	wdt->wdd.info = &apple_wdt_info;
 	wdt->wdd.max_hw_heartbeat_ms = U32_MAX / wdt->clk_rate * 1000;
@@ -192,7 +214,15 @@ static int apple_wdt_probe(struct platform_device *pdev)
 	watchdog_stop_on_unregister(&wdt->wdd);
 	watchdog_set_restart_priority(&wdt->wdd, 128);
 
-	return devm_watchdog_register_device(dev, &wdt->wdd);
+	ret = devm_watchdog_register_device(dev, &wdt->wdd);
+	if (ret)
+		return apple_wdt_probe_err(dev, report, ret,
+					   "failed to register watchdog device");
+
+	if (report)
+		dev_info(dev, "registered at %lu Hz\n", wdt->clk_rate);
+
+	return 0;
 }
 
 static int apple_wdt_resume(struct device *dev)
@@ -218,6 +248,8 @@ static int apple_wdt_suspend(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(apple_wdt_pm_ops, apple_wdt_suspend, apple_wdt_resume);
 
 static const struct of_device_id apple_wdt_of_match[] = {
+	{ .compatible = "apple,t8140-wdt", .data = &apple_wdt_report },
+	{ .compatible = "apple,t8152-wdt", .data = &apple_wdt_report },
 	{ .compatible = "apple,t8103-wdt" },
 	{ .compatible = "apple,wdt" },
 	{},
