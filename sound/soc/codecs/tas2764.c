@@ -11,9 +11,6 @@
 #include <linux/hwmon.h>
 #include <linux/pm.h>
 #include <linux/i2c.h>
-#include <linux/list.h>
-#include <linux/mutex.h>
-#include <linux/refcount.h>
 #include <linux/gpio/consumer.h>
 #include <linux/regulator/consumer.h>
 #include <linux/regmap.h>
@@ -33,24 +30,6 @@ enum tas2764_devid {
 	DEVID_SN012776 = 1
 };
 
-/*
- * Amps that share one SDZ supply and carry "apple,sdz-group-fail-closed" form
- * a group. An over-temperature or over-current fault on any of them forces the
- * supply off, which puts every amp of the group in hardware shutdown, and no
- * amp of the group enables the supply again until the driver is reloaded. The
- * supply's own enable count cannot do this: one amp's disable leaves a shared
- * line up for the others.
- */
-struct tas2764_sdz_group {
-	struct list_head node;
-	struct device_node *supply;	/* the SDZ-supply node: the group's key */
-	refcount_t users;
-	bool failed;
-};
-
-static LIST_HEAD(tas2764_sdz_groups);
-static DEFINE_MUTEX(tas2764_sdz_groups_lock);
-
 struct tas2764_priv {
 	struct snd_soc_component *component;
 	struct gpio_desc *reset_gpio;
@@ -63,10 +42,11 @@ struct tas2764_priv {
 
 	int v_sense_slot;
 	int i_sense_slot;
+	/* TAS2764_CLK_CFG value for a fixed BCLK/FS ratio, or -1 to auto-detect */
+	int bclk_ratio_code;
 
 	bool dac_powered;
 	bool unmuted;
-	struct tas2764_sdz_group *sdz_group;
 
 	struct {
 		int tx_mode;
@@ -75,97 +55,6 @@ struct tas2764_priv {
 };
 
 #include "tas2764-quirks.h"
-
-/* LTCH0 faults that shut the whole SDZ group down: over temperature, over current */
-#define TAS2764_INT_LTCH0_GROUP_FAULTS	(BIT(0) | BIT(1))
-
-static bool tas2764_group_failed(struct tas2764_priv *tas2764)
-{
-	return tas2764->sdz_group && READ_ONCE(tas2764->sdz_group->failed);
-}
-
-/* Force the shared SDZ supply off for the whole group; idempotent. */
-static void tas2764_group_shutdown(struct tas2764_priv *tas2764, unsigned int cause)
-{
-	struct tas2764_sdz_group *group = tas2764->sdz_group;
-	int ret;
-
-	/* Under tas2764_sdz_enable()'s lock: no amp can enable the supply in between */
-	mutex_lock(&tas2764_sdz_groups_lock);
-	WRITE_ONCE(group->failed, true);
-	ret = regulator_force_disable(tas2764->sdz_reg);
-	mutex_unlock(&tas2764_sdz_groups_lock);
-	dev_crit(tas2764->dev, "SDZ group shut down (cause %#x): %s\n", cause,
-		 ret ? "forcing the supply off FAILED" :
-		       "every amp of the group is in hardware shutdown");
-}
-
-/* Enable the SDZ supply unless the amp's group failed; the check and the enable are one step. */
-static int tas2764_sdz_enable(struct tas2764_priv *tas2764)
-{
-	int ret;
-
-	if (!tas2764->sdz_group)
-		return regulator_enable(tas2764->sdz_reg);
-
-	mutex_lock(&tas2764_sdz_groups_lock);
-	ret = READ_ONCE(tas2764->sdz_group->failed) ? -EIO : regulator_enable(tas2764->sdz_reg);
-	mutex_unlock(&tas2764_sdz_groups_lock);
-	return ret;
-}
-
-static void tas2764_group_leave(void *data)
-{
-	struct tas2764_sdz_group *group = data;
-
-	mutex_lock(&tas2764_sdz_groups_lock);
-	if (refcount_dec_and_test(&group->users)) {
-		list_del(&group->node);
-		of_node_put(group->supply);
-		kfree(group);
-	}
-	mutex_unlock(&tas2764_sdz_groups_lock);
-}
-
-static int tas2764_group_join(struct device *dev, struct tas2764_priv *tas2764)
-{
-	struct tas2764_sdz_group *group;
-	struct device_node *supply;
-
-	if (!of_property_read_bool(dev->of_node, "apple,sdz-group-fail-closed"))
-		return 0;
-	/* A group acts on the shared supply: an amp's own shutdown GPIO would bypass it */
-	if (tas2764->sdz_gpio)
-		return dev_err_probe(dev, -EINVAL, "SDZ group with a shutdown GPIO of its own\n");
-	/* Without its fault interrupt the amp could never take the group down */
-	if (!tas2764->irq)
-		return dev_err_probe(dev, -EINVAL, "SDZ group without a fault interrupt\n");
-	supply = of_parse_phandle(dev->of_node, "SDZ-supply", 0);
-	if (!supply)
-		return dev_err_probe(dev, -EINVAL, "SDZ group without an SDZ supply\n");
-
-	mutex_lock(&tas2764_sdz_groups_lock);
-	list_for_each_entry(group, &tas2764_sdz_groups, node) {
-		if (group->supply == supply) {
-			refcount_inc(&group->users);
-			of_node_put(supply);
-			goto found;
-		}
-	}
-	group = kzalloc(sizeof(*group), GFP_KERNEL);
-	if (!group) {
-		mutex_unlock(&tas2764_sdz_groups_lock);
-		of_node_put(supply);
-		return -ENOMEM;
-	}
-	group->supply = supply;
-	refcount_set(&group->users, 1);
-	list_add(&group->node, &tas2764_sdz_groups);
-found:
-	mutex_unlock(&tas2764_sdz_groups_lock);
-	tas2764->sdz_group = group;
-	return devm_add_action_or_reset(dev, tas2764_group_leave, group);
-}
 
 static const char *tas2764_int_ltch0_msgs[8] = {
 	"fault: over temperature", /* INT_LTCH0 & BIT(0) */
@@ -191,18 +80,12 @@ static irqreturn_t tas2764_irq(int irq, void *data)
 {
 	struct tas2764_priv *tas2764 = data;
 	u8 latched[6] = {0, 0, 0, 0, 0, 0};
-	unsigned int val;
 	int ret = IRQ_NONE;
 	int i;
 
-	/* A failed read is no fault report: an errno would read as every fault bit. */
-	for (i = 0; i < ARRAY_SIZE(latched); i++) {
-		if (regmap_read(tas2764->regmap, tas2764_int_readout_regs[i], &val)) {
-			dev_err_ratelimited(tas2764->dev, "interrupt latch %d unreadable\n", i);
-			return IRQ_NONE;
-		}
-		latched[i] = val;
-	}
+	for (i = 0; i < ARRAY_SIZE(latched); i++)
+		latched[i] = snd_soc_component_read(tas2764->component,
+						    tas2764_int_readout_regs[i]);
 
 	for (i = 0; i < 8; i++) {
 		if (latched[0] & BIT(i)) {
@@ -211,9 +94,6 @@ static irqreturn_t tas2764_irq(int irq, void *data)
 			ret = IRQ_HANDLED;
 		}
 	}
-
-	if ((latched[0] & TAS2764_INT_LTCH0_GROUP_FAULTS) && tas2764->sdz_group)
-		tas2764_group_shutdown(tas2764, latched[0]);
 
 	if (latched[0]) {
 		dev_err_ratelimited(tas2764->dev, "other context to the fault: %02x,%02x,%02x,%02x,%02x",
@@ -247,9 +127,6 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 	unsigned int val;
 	int ret;
 
-	if (tas2764_group_failed(tas2764))
-		return -EIO;
-
 	if (tas2764->dac_powered)
 		val = tas2764->unmuted ?
 			TAS2764_PWR_CTRL_ACTIVE : TAS2764_PWR_CTRL_MUTE;
@@ -268,17 +145,6 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 }
 
 #ifdef CONFIG_PM
-/*
- * Members of an SDZ group keep the shared SDZ line high across system sleep: the amp waits in
- * software shutdown, as it does between streams, and keeps its registers. Pulling SDZ low here
- * meant a power-on reset at resume, and soc_resume_deferred() unmutes the amps of a running stream
- * a few milliseconds later: their I/V sense then read a negative average power for several
- * seconds, and the uncached page-0xfd quirk writes were lost. After cold boot no amp is unmuted
- * that fresh out of reset.
- *
- * Amps outside a group keep the earlier behaviour (SDZ low across sleep) until the change has run
- * on the machines that use them.
- */
 static int tas2764_codec_suspend(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
@@ -291,12 +157,10 @@ static int tas2764_codec_suspend(struct snd_soc_component *component)
 	if (ret < 0)
 		return ret;
 
-	if (!tas2764->sdz_group) {
-		if (tas2764->sdz_gpio)
-			gpiod_set_value_cansleep(tas2764->sdz_gpio, 0);
+	if (tas2764->sdz_gpio)
+		gpiod_set_value_cansleep(tas2764->sdz_gpio, 0);
 
-		regulator_disable(tas2764->sdz_reg);
-	}
+	regulator_disable(tas2764->sdz_reg);
 
 	regcache_cache_only(tas2764->regmap, true);
 	regcache_mark_dirty(tas2764->regmap);
@@ -311,18 +175,18 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 	int ret;
 
-	if (!tas2764->sdz_group) {
-		ret = regulator_enable(tas2764->sdz_reg);
-		if (ret) {
-			dev_err(tas2764->dev, "Failed to enable regulator\n");
-			return ret;
-		}
+	ret = regulator_enable(tas2764->sdz_reg);
 
-		if (tas2764->sdz_gpio)
-			gpiod_set_value_cansleep(tas2764->sdz_gpio, 1);
-
-		usleep_range(1000, 2000);
+	if (ret) {
+		dev_err(tas2764->dev, "Failed to enable regulator\n");
+		return ret;
 	}
+
+	if (tas2764->sdz_gpio) {
+		gpiod_set_value_cansleep(tas2764->sdz_gpio, 1);
+	}
+
+	usleep_range(1000, 2000);
 
 	regcache_cache_only(tas2764->regmap, false);
 
@@ -376,16 +240,6 @@ static const struct snd_soc_dapm_route tas2764_audio_map[] = {
 	{"ISENSE", "Switch", "IMON"},
 	{"VSENSE", "Switch", "VMON"},
 };
-
-/* A failed SDZ group refuses every stream until the driver is reloaded */
-static int tas2764_startup(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
-{
-	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(dai->component);
-
-	if (tas2764_group_failed(tas2764))
-		return -EIO;
-	return 0;
-}
 
 static int tas2764_mute(struct snd_soc_dai *dai, int mute, int direction)
 {
@@ -748,7 +602,6 @@ static int tas2764_set_bclk_ratio(struct snd_soc_dai *dai, unsigned int ratio)
 }
 
 static const struct snd_soc_dai_ops tas2764_dai_ops = {
-	.startup = tas2764_startup,
 	.mute_stream = tas2764_mute,
 	.hw_params  = tas2764_hw_params,
 	.set_fmt    = tas2764_set_fmt,
@@ -919,7 +772,7 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 
 	tas2764->component = component;
 
-	ret = tas2764_sdz_enable(tas2764);
+	ret = regulator_enable(tas2764->sdz_reg);
 	if (ret != 0) {
 		dev_err(tas2764->dev, "Failed to enable regulator: %d\n", ret);
 		return ret;
@@ -958,8 +811,6 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 		ret = devm_request_threaded_irq(tas2764->dev, tas2764->irq, NULL, tas2764_irq,
 						IRQF_ONESHOT | IRQF_SHARED | IRQF_TRIGGER_LOW,
 						"tas2764", tas2764);
-		if (ret && tas2764->sdz_group)
-			return dev_err_probe(tas2764->dev, ret, "SDZ group needs its fault IRQ\n");
 		if (ret)
 			dev_warn(tas2764->dev, "failed to request IRQ: %d\n", ret);
 	}
@@ -1000,16 +851,25 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 		break;
 	}
 
+	if (tas2764->bclk_ratio_code >= 0) {
+		ret = snd_soc_component_write(component, TAS2764_CLK_CFG,
+					      tas2764->bclk_ratio_code);
+		if (ret < 0)
+			return ret;
+
+		ret = snd_soc_component_update_bits(component, TAS2764_TDM_CFG0,
+						    TAS2764_TDM_CFG0_FIXED_RATIO,
+						    TAS2764_TDM_CFG0_FIXED_RATIO);
+		if (ret < 0)
+			return ret;
+	}
+
 	return 0;
 }
 
 static void tas2764_codec_remove(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
-
-	/* A failed group's supply was forced off: there is no enable left to balance. */
-	if (tas2764_group_failed(tas2764))
-		return;
 
 	regulator_disable(tas2764->sdz_reg);
 }
@@ -1062,13 +922,13 @@ static const struct reg_default tas2764_reg_defaults[] = {
 	{ TAS2764_PAGE, 0x00 },
 	{ TAS2764_SW_RST, 0x00 },
 	{ TAS2764_PWR_CTRL, 0x1a },
+	{ TAS2764_DVC, 0x00 },
 	{ TAS2764_CHNL_0, 0x28 },
 	{ TAS2764_TDM_CFG0, 0x09 },
 	{ TAS2764_TDM_CFG1, 0x02 },
 	{ TAS2764_TDM_CFG2, 0x0a },
 	{ TAS2764_TDM_CFG3, 0x10 },
 	{ TAS2764_TDM_CFG5, 0x42 },
-	{ TAS2764_DVC, 0x00 },
 	{ TAS2764_INT_CLK_CFG, 0x19 },
 };
 
@@ -1112,9 +972,24 @@ static const struct regmap_config tas2764_i2c_regmap = {
 	.max_register = 0xffff,
 };
 
+/*
+ * BCLK/FS ratios and the TAS2764_CLK_CFG value that makes the amplifier
+ * accept them. Only the J873 speaker frame (250 BCLKs, which the ratio
+ * auto-detection rejects with "bad TDM clock") is verified on hardware;
+ * other ratios are left to the auto-detection.
+ */
+static const struct {
+	u16 ratio;
+	u8 code;
+} tas2764_bclk_ratio_codes[] = {
+	{ 250, 0x30 },
+};
+
 static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 {
+	u32 ratio;
 	int ret = 0;
+	int i;
 
 	tas2764->sdz_reg = devm_regulator_get(dev, "SDZ");
 	if (IS_ERR(tas2764->sdz_reg))
@@ -1148,7 +1023,16 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 	if (ret)
 		tas2764->v_sense_slot = -1;
 
-	return tas2764_group_join(dev, tas2764);
+	if (!fwnode_property_read_u32(dev->fwnode, "ti,bclk-ratio", &ratio)) {
+		for (i = 0; i < ARRAY_SIZE(tas2764_bclk_ratio_codes); i++)
+			if (tas2764_bclk_ratio_codes[i].ratio == ratio)
+				tas2764->bclk_ratio_code = tas2764_bclk_ratio_codes[i].code;
+		if (tas2764->bclk_ratio_code < 0)
+			return dev_err_probe(dev, -EINVAL,
+					     "unsupported ti,bclk-ratio %u\n", ratio);
+	}
+
+	return 0;
 }
 
 static int tas2764_i2c_probe(struct i2c_client *client)
@@ -1165,6 +1049,8 @@ static int tas2764_i2c_probe(struct i2c_client *client)
 
 	tas2764->dev = &client->dev;
 	tas2764->irq = client->irq;
+	/* Auto-detect the ratio unless the firmware node sets one. */
+	tas2764->bclk_ratio_code = -1;
 	i2c_set_clientdata(client, tas2764);
 	dev_set_drvdata(&client->dev, tas2764);
 
@@ -1178,9 +1064,11 @@ static int tas2764_i2c_probe(struct i2c_client *client)
 
 	if (client->dev.of_node) {
 		result = tas2764_parse_dt(&client->dev, tas2764);
-		if (result)
-			return dev_err_probe(tas2764->dev, result,
-					     "Failed to parse devicetree\n");
+		if (result) {
+			dev_err(tas2764->dev, "%s: Failed to parse devicetree\n",
+				__func__);
+			return result;
+		}
 	}
 
 	if (IS_REACHABLE(CONFIG_HWMON)) {
@@ -1204,7 +1092,7 @@ static int tas2764_i2c_probe(struct i2c_client *client)
 }
 
 static const struct i2c_device_id tas2764_i2c_id[] = {
-	{ .name = "tas2764" },
+	{ "tas2764"},
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, tas2764_i2c_id);
