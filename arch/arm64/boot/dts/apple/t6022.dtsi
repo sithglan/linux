@@ -330,6 +330,10 @@
 	compatible = "apple,t6022-ane";
 };
 
+&ane {
+	compatible = "apple,t6022-ane";
+};
+
 &aic {
 	affinities {
 		e-core-pmu-affinity {

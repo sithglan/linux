@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J873/T8152 initial Linux thermal bring-up.
+ * Addresses, affinities and minimum OPPs are from live J873 evidence.
+ * Only the two lowest OPPs are exposed until cooling is qualified.
+ * m1n1 supplies usable RAM, the framebuffer and CPU release addresses.
+ */
+/dts-v1/;
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/spmi/spmi.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/thermal/thermal.h>
+/ {
+	compatible = "apple,j873g", "apple,t8152", "apple,arm-platform";
+	model = "Apple Mac mini (M6, J873)";
+	aurora,minimal-boot;
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&aic>;
+	aliases { serial0 = &dockchannel; };
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		stdout-path = "serial0:1500000n8";
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+	};
+	reserved-memory {
+		#address-cells = <2>; #size-cells = <2>; ranges;
+		smc-firmware@30de00000 { reg = <3 0x0de00000 0 0x120000>; no-map; };
+	};
+	memory@10000000000 { device_type = "memory"; reg = <0x100 0 0 0>; };
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+		cpu0: cpu@0 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x0>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu1: cpu@1 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x1>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu2: cpu@2 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x2>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu3: cpu@3 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x3>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu4: cpu@4 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x4>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu5: cpu@5 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x5>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_e_opp>;
+			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu6: cpu@10100 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x10100>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu7: cpu@10101 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x10101>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu8: cpu@40102 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x40102>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu9: cpu@40103 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x40103>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu10: cpu@40104 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x40104>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
+		};
+		cpu11: cpu@40105 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x40105>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+			operating-points-v2 = <&m6_pm_opp>;
+			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
+		};
+	};
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+	};
+	m6_e_opp: opp-table-e {
+		compatible = "operating-points-v2"; opp-shared;
+		opp-972000000 { opp-hz = /bits/ 64 <972000000>; opp-level = <2>; };
+		opp-1152000000 { opp-hz = /bits/ 64 <1152000000>; opp-level = <3>; };
+	};
+	m6_pm_opp: opp-table-pm {
+		compatible = "operating-points-v2"; opp-shared;
+		opp-1440000000 { opp-hz = /bits/ 64 <1440000000>; opp-level = <2>; };
+		opp-1728000000 { opp-hz = /bits/ 64 <1728000000>; opp-level = <3>; };
+	};
+	/* The 24 MHz timebase (ADT timebase-frequency), as on T8103. */
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>; #size-cells = <2>; ranges; nonposted-mmio;
+		aic: interrupt-controller@301000000 {
+			compatible = "apple,t8152-aic3";
+			interrupt-controller; #interrupt-cells = <3>; #address-cells = <0>;
+			reg = <3 0x01000000 0 0x1cc000>, <3 0x01040000 0 0x4000>;
+			reg-names = "core", "event";
+		};
+		dockchannel: serial@30812c000 {
+			compatible = "apple,dockchannel-uart";
+			reg = <3 0x0812c000 0 0x4000>, <3 0x08128000 0 0x4000>,
+			      <3 0x0810c000 0 0x1000>;
+			reg-names = "data", "config", "irq";
+			interrupts = <AIC_IRQ 662 IRQ_TYPE_LEVEL_HIGH>;
+		};
+		m6_e_cpufreq: performance-controller@210e20000 {
+			compatible = "apple,t8152-cluster-cpufreq";
+			reg = <2 0x10e20000 0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+		m6_pm_cpufreq: performance-controller@211e20000 {
+			compatible = "apple,t8152-cluster-cpufreq";
+			reg = <2 0x11e20000 0 0x1000>;
+			#performance-domain-cells = <0>;
+		};
+		/*
+		 * ADT /arm-io/nub-spmi0 (gen 4) and its primary PMU, pmu-main
+		 * ("woodcote", slave 0xe). The boot flags live in the legacy
+		 * scratchpad (info-leg_scrpad = 0xf800), laid out as on T8103
+		 * and T8140; boot_stage read 0x30 (kernel started) here.
+		 */
+		nub_spmi0: spmi@308714000 {
+			/*
+			 * Gen 4: FIFO registers at 0x200 (the block is 0x4000
+			 * long); polled, so no interrupts are described yet.
+			 */
+			compatible = "apple,t8152-spmi";
+			reg = <0x3 0x08714000 0x0 0x4000>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			pmic@e {
+				compatible = "apple,woodcote-pmic", "apple,spmi-nvmem";
+				reg = <0xe SPMI_USID>;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					boot_stage: boot-stage@f801 {
+						reg = <0xf801 0x1>;
+					};
+
+					boot_error_count: boot-error-count@f802,0 {
+						reg = <0xf802 0x1>;
+						bits = <0 4>;
+					};
+
+					panic_count: panic-count@f802,4 {
+						reg = <0xf802 0x1>;
+						bits = <4 4>;
+					};
+
+					/* Set before off1, or the machine powers back on. */
+					shutdown_flag: shutdown-flag@f80f,3 {
+						reg = <0xf80f 0x1>;
+						bits = <3 1>;
+					};
+				};
+			};
+		};
+
+		/* ADT /arm-io/wdt (wdt,t8152): restart fallback and /dev/watchdog. */
+		m6_wdt: watchdog@3082b0000 {
+			compatible = "apple,t8152-wdt", "apple,t8103-wdt";
+			reg = <3 0x082b0000 0 0x4000>;
+			clocks = <&clkref>;
+			interrupts = <AIC_IRQ 447 IRQ_TYPE_LEVEL_HIGH>;
+		};
+		m6_smc_mbox: mailbox@30c710080 {
+			compatible = "apple,t8152-ascwrap-v8-mailbox";
+			reg = <3 0x0c710080 0 0x80>;
+			/* IRQ 759 follows RX occupancy on physical hardware. */
+			interrupts = <AIC_IRQ 760 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 759 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+		m6_smc: smc@30c600000 {
+			compatible = "apple,t8152-smc";
+			reg = <3 0x0c600000 0 0x74000>, <3 0x0de00000 0 0x120000>;
+			reg-names = "smc", "sram";
+			mboxes = <&m6_smc_mbox>;
+			/* Power off (MBSE = off1) and restart (MBSE = phra). */
+			m6_smc_reboot: reboot {
+				compatible = "apple,smc-reboot";
+				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+					      <&boot_error_count>, <&panic_count>;
+				nvmem-cell-names = "shutdown_flag", "boot_stage",
+						   "boot_error_count", "panic_count";
+			};
+
+			m6_smc_hwmon: hwmon {
+				compatible = "apple,smc-hwmon";
+				#thermal-sensor-cells = <1>;
+				fan-0 {
+					apple,key-id = "F0Ac";
+					label = "SMC fan 0";
+					apple,fan-minimum = "F0Mn";
+					apple,fan-maximum = "F0Mx";
+					apple,fan-target = "F0Tg";
+					apple,fan-mode = "F0md";
+				};
+			};
+		};
+	};
+};
+#include "t8152-j873-thermal-sensors.dtsi"
+#include "t8152-j873-gpu.dtsi"
+#include "t8152-j873-pmp.dtsi"

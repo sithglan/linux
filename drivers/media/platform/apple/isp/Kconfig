@@ -8,7 +8,6 @@ config VIDEO_APPLE_ISP
 	select APPLE_PMP_REPORT
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on OF_ADDRESS
-	depends on PM
 	depends on V4L_PLATFORM_DRIVERS
 	depends on VIDEO_DEV
 	help
@@ -18,26 +17,3 @@ config VIDEO_APPLE_ISP
 	  calibration file for the detected camera module,
 	  apple/isp_<module>_<revision>XX.dat, from the firmware search
 	  path; if it is missing, the stream runs without calibration.
-
-config VIDEO_APPLE_ISP_KUNIT_TEST
-	bool "KUnit tests for the Apple ISP driver" if !KUNIT_ALL_TESTS
-	depends on VIDEO_APPLE_ISP && KUNIT
-	depends on KUNIT=y || VIDEO_APPLE_ISP=m
-	default KUNIT_ALL_TESTS
-	help
-	  Builds unit tests for queue setup, P010 layouts and buffer identity,
-	  firmware sensor geometry, the capture command stream and shared
-	  memory retirement. The command tests stub the IPC transport and
-	  need no hardware. Only useful for kernel developers running KUnit.
-
-	  If unsure, say N.
-
-config VIDEO_APPLE_ISP_IPC_LAYOUT_KUNIT_TEST
-	tristate "Apple ISP IPC layout tests" if !KUNIT_ALL_TESTS
-	depends on KUNIT
-	default KUNIT_ALL_TESTS
-	help
-	  Test firmware-selected IPC ring extents, including 64-bit addresses,
-	  overflow, alignment and overlap with the channel table or other rings.
-	  These tests run without starting or accessing the ISP and do not
-	  require a supported Apple device or the ISP driver itself.

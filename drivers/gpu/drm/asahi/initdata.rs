@@ -16,7 +16,7 @@ use crate::fw::initdata::*;
 use crate::fw::types::*;
 use crate::module_parameters;
 use crate::{
-    driver::AsahiDrmDevice,
+    driver::AsahiDevice,
     gem,
     gpu,
     hw,
@@ -25,9 +25,6 @@ use crate::{
 use kernel::error::{
     Error,
     Result, //
-};
-use kernel::io::{
-    Io, //
 };
 use kernel::macros::versions;
 use kernel::prelude::*;
@@ -39,7 +36,7 @@ use ::pin_init::Init;
 /// Builder helper for the global GPU InitData.
 #[versions(AGX)]
 pub(crate) struct InitDataBuilder<'a> {
-    dev: &'a AsahiDrmDevice,
+    dev: &'a AsahiDevice,
     alloc: &'a mut gpu::KernelAllocators,
     cfg: &'static hw::HwConfig,
     dyncfg: &'a hw::DynConfig,
@@ -49,7 +46,7 @@ pub(crate) struct InitDataBuilder<'a> {
 impl<'a> InitDataBuilder::ver<'a> {
     /// Create a new InitData builder
     pub(crate) fn new(
-        dev: &'a AsahiDrmDevice,
+        dev: &'a AsahiDevice,
         alloc: &'a mut gpu::KernelAllocators,
         cfg: &'static hw::HwConfig,
         dyncfg: &'a hw::DynConfig,
@@ -540,11 +537,7 @@ impl<'a> InitDataBuilder::ver<'a> {
                     unk_28: U64(0), // U64(0x11_00000000),
                     // Unknown page
                     //unk_30: U64(0x6f_ffff8000),
-                    unk_30: U64(mmu::UatGeometry {
-                        ias: cfg.uat_ias,
-                        oas: cfg.uat_oas,
-                    }
-                    .unk_page()),
+                    unk_30: U64(mmu::IOVA_UNK_PAGE),
                     timestamp_area_base: U64(gpu::IOVA_KERN_TIMESTAMP_RANGE.start),
                     // TODO: yuv matrices
                     chip_id: cfg.chip_id,
@@ -571,7 +564,9 @@ impl<'a> InitDataBuilder::ver<'a> {
                     num_frags: dyncfg.id.num_frags * dyncfg.id.num_clusters,
                     unk_554: 0x1,
                     uat_ttb_base: U64(dyncfg.uat_ttb_base),
-                    gpu_core_id: cfg.gpu_core as u32,
+                    // Firmware-ABI core id; absent (AGX3) configs must never
+                    // reach this builder, and fail closed here if they do.
+                    gpu_core_id: cfg.gpu_core.ok_or(ENODEV)? as u32,
                     gpu_rev_id: dyncfg.id.gpu_rev_id as u32,
                     num_cores: dyncfg.id.num_cores * dyncfg.id.num_clusters,
                     max_pstate: dyncfg.pwr.perf_states.len() as u32 - 1,
@@ -864,12 +859,7 @@ impl<'a> InitDataBuilder::ver<'a> {
         let hwb = self.hwdata_b()?;
 
         let mut buffer_mgr_ctl = gem::new_kernel_object(self.dev, 0x4000)?;
-        // TODO: aren't new GEM shmem object zero initialized?
-        let size = buffer_mgr_ctl.size();
-        let vmap = buffer_mgr_ctl.vmap()?;
-        for off in 0..size {
-            vmap.try_write8(0x0, off)?;
-        }
+        buffer_mgr_ctl.vmap()?.memset(0);
 
         GpuObject::new_init_prealloc(
             self.alloc.private.alloc_object()?,

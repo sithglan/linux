@@ -19,7 +19,7 @@ use crate::{
     }, //
 };
 
-use core::marker::PhantomData;
+use core::{marker::PhantomData, mem::MaybeUninit};
 
 /// 96-bit message. What it means is up to the upper layer
 pub type Message = bindings::apple_mbox_msg;
@@ -127,3 +127,107 @@ where
     T::Data: Send,
 {
 }
+
+/// Firmware role owned by a T8140 ASCWrap v6 mailbox provider.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum AscwrapV6Role {
+    /// Primary GPU firmware role.
+    Gfx,
+    /// Secondary GPU firmware role.
+    Gfx1,
+}
+
+/// Provider-owned ASCWrap v6 lifecycle facts.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct AscwrapV6Lifecycle {
+    /// Firmware role owned by this provider.
+    pub role: AscwrapV6Role,
+    /// CPU physical base and size of the provider-owned wrapper window.
+    pub wrapper: (u64, u64),
+    /// CPU physical base and size of the provider-owned IOP VBAR window.
+    pub iop_vbar: (u64, u64),
+    /// Remaining provider lifecycle work. Zero for T8140.
+    pub missing: u32,
+}
+
+/// Non-owning handle used to query an ASCWrap v6 mailbox provider.
+///
+/// The provider, not the consumer, maps the wrapper and IOP VBAR resources.
+/// This handle exposes no MMIO pointer. CPU start and stop remain serialized
+/// inside the provider.
+pub struct AscwrapV6Provider {
+    mbox: *mut bindings::apple_mbox,
+}
+
+impl AscwrapV6Provider {
+    /// Resolve one provider from a consumer's `mboxes` list.
+    pub fn get(dev: &device::Device, index: usize) -> Result<Self> {
+        // SAFETY: `dev` is a live device and the returned provider pointer is
+        // tied to the automatic device link created by apple_mbox_get().
+        let mbox =
+            unsafe { from_err_ptr(bindings::apple_mbox_get(dev.as_raw(), index.try_into()?)) }?;
+        Ok(Self { mbox })
+    }
+
+    /// Return the exact provider-owned resources and lifecycle gates.
+    pub fn lifecycle(&self) -> Result<AscwrapV6Lifecycle> {
+        let mut raw = MaybeUninit::<bindings::apple_mbox_ascwrap_v6_lifecycle>::uninit();
+        // SAFETY: `self.mbox` is valid and `raw` points to writable storage.
+        to_result(unsafe {
+            bindings::apple_mbox_ascwrap_v6_get_lifecycle(self.mbox, raw.as_mut_ptr())
+        })?;
+        // SAFETY: the successful C call initialized every field.
+        let raw = unsafe { raw.assume_init() };
+        let role = match raw.role as u32 {
+            // Values are fixed by enum apple_mbox_ascwrap_v6_role.
+            1 => AscwrapV6Role::Gfx,
+            2 => AscwrapV6Role::Gfx1,
+            _ => return Err(EINVAL),
+        };
+
+        Ok(AscwrapV6Lifecycle {
+            role,
+            wrapper: (raw.wrapper_start, raw.wrapper_size),
+            iop_vbar: (raw.iop_vbar_start, raw.iop_vbar_size),
+            missing: raw.missing,
+        })
+    }
+
+    /// Check that this provider has a complete matching CPU stop operation.
+    pub fn require_safe_cpu_lifecycle(&self) -> Result {
+        // SAFETY: this is a capability check on a valid provider pointer.
+        to_result(unsafe { bindings::apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(self.mbox) })
+    }
+
+    /// Start this provider's CPU with the ASCWrap v6 `_runCPU(true)` transform.
+    pub fn start_cpu(&self) -> Result {
+        // SAFETY: the provider owns and synchronizes its wrapper mapping.
+        to_result(unsafe { bindings::apple_mbox_ascwrap_v6_start_cpu(self.mbox) })
+    }
+
+    /// Stop this provider's CPU with the ASCWrap v6 `_runCPU(false)` transform.
+    pub fn stop_cpu(&self) -> Result {
+        // SAFETY: the provider owns and synchronizes its wrapper mapping.
+        to_result(unsafe { bindings::apple_mbox_ascwrap_v6_stop_cpu(self.mbox) })
+    }
+
+    /// Read hardware CPU control and status through the serialized provider.
+    /// A completed stop request alone does not establish CPU quiescence.
+    pub fn cpu_state(&self) -> Result<(u32, u32)> {
+        let mut control = 0;
+        let mut status = 0;
+        // SAFETY: the provider pointer remains valid and both outputs refer
+        // to writable stack storage for the duration of the call.
+        to_result(unsafe {
+            bindings::apple_mbox_ascwrap_v6_get_cpu_state(
+                self.mbox, &mut control, &mut status)
+        })?;
+        Ok((control, status))
+    }
+}
+
+// SAFETY: provider state is internally synchronized by the C mailbox driver;
+// this wrapper only exposes provider-serialized queries and CPU transitions.
+unsafe impl Send for AscwrapV6Provider {}
+// SAFETY: as above.
+unsafe impl Sync for AscwrapV6Provider {}

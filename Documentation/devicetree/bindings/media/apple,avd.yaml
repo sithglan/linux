@@ -7,7 +7,7 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Apple AVD (Apple Video Decoder)
 
 description:
-  AVD is a video decode block present on all apple silicon devices.
+  AVD is a video decode block present on Apple silicon devices.
 
 maintainers:
   - Sofus <sofus.c@icloud.com>
@@ -34,10 +34,10 @@ properties:
 
   reg:
     items:
-      - description: cm3 code
-      - description: cm3 sram
-      - description: mbox registers
-      - description: decode ctrl registers
+      - description: Cortex-M3 code memory
+      - description: Cortex-M3 SRAM
+      - description: Cortex-M3 mailbox registers
+      - description: Decode control registers
 
   reg-names:
     items:
@@ -101,3 +101,4 @@ examples:
             iommus = <&avd_dart 0>;
         };
     };
+...

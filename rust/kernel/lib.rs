@@ -80,6 +80,8 @@ pub mod cred;
 pub mod debugfs;
 pub mod device;
 pub mod device_id;
+#[cfg(CONFIG_DEV_COREDUMP)]
+pub mod devcoredump;
 pub mod devres;
 pub mod dma;
 #[cfg(CONFIG_DRM = "y")]
@@ -110,6 +112,7 @@ pub mod init;
 pub mod interop;
 pub mod interrupt;
 pub mod io;
+pub mod iosys_map;
 pub mod ioctl;
 pub mod iommu;
 pub mod iov;

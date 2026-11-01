@@ -35,6 +35,14 @@ config PCIE_ALTERA_MSI
 	  Say Y here if you want PCIe MSI support for the Altera FPGA.
 	  This MSI driver supports Altera MSI to GIC controller IP.
 
+config PCIE_APPLE_MSI
+	bool "Apple PCIe MSI controller for a bootloader-trained port"
+	depends on PCIE_APPLE=y
+	select IRQ_MSI_LIB
+	help
+	  MSIs for an Apple PCIe port that Linux drives as a generic ECAM
+	  host because the bootloader trained the link (T8142 Wi-Fi).
+
 config PCIE_APPLE_MSI_DOORBELL_ADDR
 	hex
 	default 0xfffff000

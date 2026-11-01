@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+
+/* Accepted full-platform J700 display, USB, input and radio companion nodes from Linux 2954e3f8. The clean board source remains authoritative for AV and boot policy. */
+
+
+
+/ {
+
+	aliases {
+
+		gpu = &gpu;
+
+		sep = &sep;
+
+		atcphy0 = &atcphy0;
+
+		dcp = &dcp;
+
+		dcp0 = &dcp;
+
+		disp0 = &display;
+
+		disp0_piodma = &disp0_piodma;
+
+
+		keyboard = &keyboard;
+
+		wifi0 = &wifi0;
+
+	};
+
+
+	clk_disp0_154: clock-disp0-154 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <300000000>;
+		clock-output-names = "clk_disp0_154";
+	};
+
+
+	clk_disp0_194: clock-disp0-194 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <450000000>;
+		clock-output-names = "clk_disp0_194";
+	};
+
+};
+
+
+
+&dcp {
+	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
+	clock-names = "clock-154", "clock-194";
+	/* The iBoot and macOS captures both use IOMFB surface slot 0. */
+	apple,iomfb-surfaces = <0>;
+	status = "okay";
+
+	panel: panel {
+		compatible = "apple,panel-j700", "apple,panel";
+		/* 2408x1506 at the ADT's measured 219 dpi. */
+		width-mm = <279>;
+		height-mm = <175>;
+		/* ADT LmaxProduct is 525 in 16.16 fixed point. */
+		apple,max-brightness = <525>;
+	};
+};
+
+&typec0 {
+	ports {
+		port@2 {
+			reg = <2>;
+
+			typec0_connector_dcp: endpoint {
+				remote-endpoint = <&dcpext_typec0>;
+			};
+		};
+	};
+};
+
+&dcp_dart {
+	status = "okay";
+};
+
+&dcp_mbox {
+	status = "okay";
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+&dispgrt_dart {
+	status = "okay";
+};
+
+&ps_disp_cpu {
+	apple,always-on;
+};
+
+&display {
+	/* Both pipes scan out buffers from the DRM device's DMA domain. */
+	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;
+	status = "okay";
+};
+
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
+};
+
+&soc {
+	pcie0_dart: iommu@390000000 {
+		compatible = "apple,t8140-dart", "apple,t8110-dart";
+		reg = <0x3 0x90000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1206 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_apcie_sys_gp>;
+	};
+
+	/*
+	 * The radio's DMA path.  This machine has no RAM below 4 GiB, so
+	 * the MT7932 needs the translated aperture of the APCIe DART and
+	 * PIODMA before its driver can claim the functions.  These used to
+	 * be applied after boot by an overlay (drivers/of/j700_radio.dtso);
+	 * the overlay module now only adds a MAC address override.
+	 */
+	piodma_radio: piodma@390030000 {
+		compatible = "apple,t8140-pcie-piodma";
+		reg = <0x3 0x90030000 0x0 0x4000>,
+		      <0x3 0x90034000 0x0 0x4000>,
+		      <0x3 0x90038000 0x0 0x4000>;
+		reg-names = "engine", "irq-aggregator", "fabric";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1207 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie0_dart 17>;
+		apple,iova-address-bits = <36>;
+		apple,piodma-base-addresses = <0x1c 0xb0000000>,
+					      <0xb 0xc0000000>,
+					      <0xb 0x80000000>;
+		apple,piodma-aperture-sizes = <0x0 0x10000000>,
+					      <0x0 0x20000000>,
+					      <0x0 0x40000000>;
+	};
+
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t8140-pcie", "apple,t6020-pcie";
+		device_type = "pci";
+
+		reg = <0x1c 0xb0000000 0x0 0x10000000>, /* ECAM */
+		      <0x3 0x94000000 0x0 0x4000>,     /* RC */
+		      <0x3 0x90028000 0x0 0x8000>,     /* port 0 */
+		      <0x3 0x97020000 0x0 0x4000>;     /* port 0 PHY */
+		reg-names = "config", "rc", "port0", "phy0";
+
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1205 IRQ_TYPE_LEVEL_HIGH>;
+
+		msi-controller;
+		msi-parent = <&pcie0>;
+		msi-ranges = <&aic AIC_IRQ 1331 IRQ_TYPE_EDGE_RISING 32>;
+		power-domains = <&ps_apcie_sys_gp>;
+
+		iommu-map = <0x100 &pcie0_dart 1 1>,
+			    <0x101 &pcie0_dart 2 1>;
+		iommu-map-mask = <0xffff>;
+		dma-coherent;
+		apple,valid-functions = <0x3>;
+		apple,endpoint-iova-address-bits = <32>;
+		apple,piodma = <&piodma_radio>;
+
+		bus-range = <0 8>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+			 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
+
+		port00: pci@0,0 {
+			device_type = "pci";
+			reg = <0x0 0x0 0x0 0x0 0x0>;
+			reset-gpios = <&pinctrl_ap 114 GPIO_ACTIVE_LOW>;
+			/*
+			 * Live J700 ADT function-reg_on is
+			 * pKW8("pcIO", 0x800000, 0x80000).  Aurora IRC
+			 * 92012-92014 records the hardware pass through the existing
+			 * macsmc-gpio provider as pin 8.
+			 */
+			pwren-gpios = <&smc_gpio 8 GPIO_ACTIVE_HIGH>;
+			maximum-link-speed = <2>;
+
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges;
+
+			interrupt-controller;
+			#interrupt-cells = <1>;
+			interrupt-map-mask = <0 0 0 7>;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+					<0 0 0 2 &port00 0 0 0 1>,
+					<0 0 0 3 &port00 0 0 0 2>,
+					<0 0 0 4 &port00 0 0 0 3>;
+
+			wifi0: wifi@0,0 {
+				compatible = "pci14c3,7932";
+				reg = <0x10000 0x0 0x0 0x0 0x0>;
+				/* To be filled by the loader */
+				local-mac-address = [00 00 00 00 00 00];
+			};
+		};
+	};
+};
+
+&spi2 {
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <135 IRQ_TYPE_EDGE_RISING>;
+		apple,smc-power-key = "pcLD";
+		apple,smc-power-rails = <0x01010000 0x01020000>;
+		firmware-name = "apple/mesacal-j700.bin";
+		status = "okay";
+	};
+};
+
+&i2c2 {
+	status = "okay";
+};
+
+&dwc3_0_dart_0 {
+	status = "okay";
+};
+
+&dwc3_0_dart_1 {
+	status = "okay";
+};
+
+&dcpext_dart {
+	status = "okay";
+};
+
+&dispext0_dart {
+	status = "okay";
+};
+
+&dcpext_mbox {
+	status = "okay";
+};
+
+&soc {
+	dcpext_bw: display-bandwidth@302828000 {
+		/* Native 25G83: BWR agent 2 and boost agent 3. */
+		reg = <0x3 0x02828000 0x0 0x8>,
+		      <0x3 0x02870000 0x0 0x4>;
+		#apple,bw-scratch-cells = <3>;
+		#apple,bw-doorbell-cells = <2>;
+	};
+};
+
+&dcpext {
+	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
+	clock-names = "clock-154", "clock-194";
+	apple,iomfb-surfaces = <0>;
+
+	/* The Type-C route owns PHY and crossbar selection on DP Alt Mode. */
+	phys = <&atcphy0 PHY_TYPE_DP>;
+	phy-names = "typec0";
+	mux-controls = <&dpxbar0 0>;
+	mux-control-names = "typec0";
+	apple,typec-mux-indices = <2>;
+	apple,typec-dptx-phys = <0>;
+	apple,bw-scratch = <&dcpext_bw 0 4 0>;
+	apple,bw-doorbell = <&dcpext_bw 1 5>;
+
+	/*
+	 * The J700 has no HDMI socket: this DCP's only output is the DP-Alt
+	 * path on the rear Type-C connector, so the connector is a USB-C one.
+	 * Without this property dcp_probe() falls through to
+	 * DRM_MODE_CONNECTOR_Unknown and DRM reports the connector as
+	 * "Unknown-2", which is wrong in every mode list, log and randr
+	 * output userspace prints.  No kernel path branches between Unknown
+	 * and USB -- the two HPD decisions in dcp.c test for DisplayPort and
+	 * eDP -- so this changes the name and nothing else.
+	 */
+	apple,connector-type = "USB-C";
+	status = "okay";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext_typec0: endpoint {
+					remote-endpoint = <&typec0_connector_dcp>;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * The SEP fingerprint sensor shim finds the SMC by the generic "apple,smc"
+ * compatible; the clean t8140.dtsi lists only the SoC-specific ones.
+ */
+&smc {
+	compatible = "apple,t8140-smc", "apple,t8103-smc", "apple,smc";
+};

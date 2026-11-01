@@ -398,21 +398,18 @@ TRACE_EVENT(dptxport_init, TP_PROTO(struct apple_dcp *dcp, u64 unit),
 
 TRACE_EVENT(
 	dptxport_apcall,
-	TP_PROTO(struct dptx_port *dptx, u16 group, int idx, size_t len),
-	TP_ARGS(dptx, group, idx, len),
+	TP_PROTO(struct dptx_port *dptx, int idx, size_t len),
+	TP_ARGS(dptx, idx, len),
 
 	TP_STRUCT__entry(__string(devname, dev_name(dptx->service->ep->dcp->dev))
-			__field(u32, unit) __field(u16, group) __field(int, idx)
-			__field(size_t, len)),
+			__field(u32, unit) __field(int, idx) __field(size_t, len)),
 
 	TP_fast_assign(__assign_str(devname);
-		       __entry->unit = dptx->unit; __entry->group = group;
-		       __entry->idx = idx; __entry->len = len;),
+		       __entry->unit = dptx->unit; __entry->idx = idx; __entry->len = len;),
 
-	TP_printk("%s: dptx%d: AP Call %u:%d (%s) with len %lu", __get_str(devname),
-		  __entry->unit, __entry->group, __entry->idx,
-		  __entry->group ? "-" : show_dptxport_apcall(__entry->idx),
-		  __entry->len));
+	TP_printk("%s: dptx%d: AP Call %d (%s) with len %lu", __get_str(devname),
+		  __entry->unit,
+		  __entry->idx, show_dptxport_apcall(__entry->idx), __entry->len));
 
 TRACE_EVENT(
 	dptxport_validate_connection,

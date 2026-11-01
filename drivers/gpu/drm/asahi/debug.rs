@@ -13,6 +13,7 @@ pub(crate) use super::{
 };
 use crate::module_parameters;
 use core::sync::atomic::{
+    AtomicBool,
     AtomicU64,
     Ordering, //
 };
@@ -95,6 +96,22 @@ pub(crate) fn debug_enabled(flag: DebugFlags) -> bool {
     DEBUG_FLAGS.load(Ordering::Relaxed) & 1 << (flag as usize) != 0
 }
 
+/// Set once the G18 application DRM node is live (`G18_DRM_READY`).
+static G18_DRM_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// Mark the G18 application DRM node live. Output before this is unaffected.
+pub(crate) fn g18_mark_drm_live() {
+    G18_DRM_LIVE.store(true, Ordering::Relaxed);
+}
+
+/// Whether a per-kick, frame-pass or per-job resource line is printed: always
+/// before `G18_DRM_READY`, afterwards only with `g18_kick_log=1`. Fault,
+/// recovery, refusal, wait, stall and admission lines never consult this.
+#[inline(always)]
+pub(crate) fn g18_kick_log() -> bool {
+    module_parameters::g18_kick_log.value() != 0 || !G18_DRM_LIVE.load(Ordering::Relaxed)
+}
+
 /// Run some code only if debug is enabled for the calling module
 #[macro_export]
 macro_rules! debug {
@@ -137,6 +154,37 @@ macro_rules! cls_dev_dbg (
     ($cls:ident, $dev:expr, $($arg:tt)*) => (
         if $crate::debug::debug_enabled($crate::debug::DebugFlags::$cls) {
             ::kernel::dev_info! ( $dev.as_ref(), $($arg)* );
+        }
+    )
+);
+
+/// dev_info!() for a G18 per-kick, frame-pass or per-job resource line
+#[macro_export]
+macro_rules! g18_kick_info (
+    ($dev:expr, $($arg:tt)*) => (
+        if $crate::debug::g18_kick_log() {
+            ::kernel::dev_info! ( $dev, $($arg)* );
+        }
+    )
+);
+
+/// pr_info!() for a G18 per-kick, frame-pass or per-job resource line
+#[macro_export]
+macro_rules! g18_kick_pr_info (
+    ($($arg:tt)*) => (
+        if $crate::debug::g18_kick_log() {
+            ::kernel::pr_info! ( $($arg)* );
+        }
+    )
+);
+
+/// dev_info!() for a firmware event record: only a `routine` record follows
+/// `g18_kick_log`; every other record is always printed
+#[macro_export]
+macro_rules! g18_event_info (
+    ($routine:expr, $dev:expr, $($arg:tt)*) => (
+        if !($routine) || $crate::debug::g18_kick_log() {
+            ::kernel::dev_info! ( $dev, $($arg)* );
         }
     )
 );

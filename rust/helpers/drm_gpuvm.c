@@ -35,4 +35,17 @@ void rust_helper_drm_gpuvm_exec_unlock(struct drm_gpuvm_exec *vm_exec)
 	drm_gpuvm_exec_unlock(vm_exec);
 }
 
+__rust_helper
+void rust_helper_drm_gpuva_init_from_op(struct drm_gpuva *va,
+					struct drm_gpuva_op_map *op)
+{
+	drm_gpuva_init_from_op(va, op);
+}
+
+__rust_helper
+bool rust_helper_drm_gpuvm_immediate_mode(struct drm_gpuvm *gpuvm)
+{
+	return drm_gpuvm_immediate_mode(gpuvm);
+}
+
 #endif // CONFIG_RUST_DRM_GPUVM

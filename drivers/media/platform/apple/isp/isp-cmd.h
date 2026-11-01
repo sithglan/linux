@@ -124,7 +124,6 @@
 #define CISP_COLORSPACE_REC709				     0x1
 #define CISP_OUTPUT_FORMAT_YUV_2PLANE			     0x0
 #define CISP_OUTPUT_FORMAT_YUV_1PLANE			     0x1
-#define CISP_OUTPUT_FORMAT_P010				     0x12
 #define CISP_OUTPUT_FORMAT_RGB				     0x2
 #define CISP_BUFFER_RECYCLE_MODE_EMPTY_ONLY		     0x1
 
@@ -198,20 +197,15 @@ struct cmd_set_dsid_clr_req_base {
 } __packed;
 static_assert(sizeof(struct cmd_set_dsid_clr_req_base) == 0x14);
 
-/*
- * H17: a count of broadcast-clear windows, their common range and the
- * windows; the command carries only the @count windows.
- */
-#define ISP_DSID_MULTI_BC_MAX 8
-
+/* H17: a count of broadcast-clear windows and the first window */
 struct cmd_set_dsid_clr_multi_bc_reg_base {
 	u64 opcode;
 	u8 count;
 	u8 pad_9[3];
 	u32 dsid_clr_range;
-	u64 dsid_clr_base[ISP_DSID_MULTI_BC_MAX];
+	u64 dsid_clr_base;
 } __packed;
-static_assert(sizeof(struct cmd_set_dsid_clr_multi_bc_reg_base) == 0x50);
+static_assert(sizeof(struct cmd_set_dsid_clr_multi_bc_reg_base) == 0x18);
 
 struct cmd_pmp_ctrl_set {
 	u64 opcode;
@@ -256,8 +250,6 @@ struct cmd_flicker_sensor_set {
 } __packed;
 static_assert(sizeof(struct cmd_flicker_sensor_set) == 0xc);
 
-int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize,
-		 int timeout);
 int isp_cmd_start(struct apple_isp *isp, u32 mode);
 int isp_cmd_stop(struct apple_isp *isp, u32 mode);
 int isp_cmd_power_down(struct apple_isp *isp);
@@ -268,8 +260,8 @@ int isp_cmd_config_get(struct apple_isp *isp, struct cmd_config_get *args);
 int isp_cmd_set_isp_pmu_base(struct apple_isp *isp, u64 pmu_base);
 int isp_cmd_set_dsid_clr_req_base(struct apple_isp *isp, u64 dsid_clr_base,
 				  u32 dsid_clr_range);
-int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, const u64 *bases,
-				  unsigned int count, u32 dsid_clr_range);
+int isp_cmd_set_dsid_clr_multi_bc(struct apple_isp *isp, u64 dsid_clr_base,
+				  u32 dsid_clr_range);
 int isp_cmd_set_dsid_clr_req_base2(struct apple_isp *isp, u64 dsid_clr_base0,
 				   u64 dsid_clr_base1, u64 dsid_clr_base2,
 				   u64 dsid_clr_base3, u32 dsid_clr_range0,
@@ -382,15 +374,6 @@ struct cmd_ch_camera_config {
 	u32 out_height2;
 } __packed;
 static_assert(sizeof(struct cmd_ch_camera_config) == 0xdc);
-
-/* H17 appends 0x44 bytes to the common camera configuration record. */
-struct cmd_ch_camera_config_h17 {
-	struct cmd_ch_camera_config config;
-	u8 unknown[0x44];
-} __packed;
-static_assert(sizeof(struct cmd_ch_camera_config_h17) == 0x120);
-static_assert(offsetof(struct cmd_ch_camera_config, in_width) == 0x10);
-static_assert(offsetof(struct cmd_ch_camera_config, out_width2) == 0xd4);
 
 struct cmd_ch_camera_config_select {
 	u64 opcode;
@@ -528,10 +511,10 @@ int isp_cmd_ch_start(struct apple_isp *isp, u32 chan);
 int isp_cmd_ch_stop(struct apple_isp *isp, u32 chan);
 int isp_cmd_ch_info_get(struct apple_isp *isp, u32 chan,
 			struct cmd_ch_info *args);
-int isp_cmd_ch_camera_config_get(struct apple_isp *isp, u32 chan, u32 index,
-				 struct cmd_ch_camera_config_h17 *args);
 int isp_cmd_ch_camera_config_current_get(struct apple_isp *isp, u32 chan,
 					 struct cmd_ch_camera_config *args);
+int isp_cmd_ch_camera_config_get(struct apple_isp *isp, u32 chan, u32 preset,
+				 struct cmd_ch_camera_config *args);
 int isp_cmd_ch_camera_config_select(struct apple_isp *isp, u32 chan,
 				    u32 preset);
 int isp_cmd_ch_set_file_load(struct apple_isp *isp, u32 chan, u64 addr,

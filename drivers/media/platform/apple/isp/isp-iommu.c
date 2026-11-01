@@ -56,35 +56,41 @@ static void isp_surf_vunmap(struct apple_isp *isp, struct isp_surf *surf)
 static void isp_surf_unreserve_iova(struct apple_isp *isp,
 				    struct isp_surf *surf)
 {
-	if (surf->iova_reserved)
-		mtree_erase(&isp->iovas, surf->iova >> isp->shift);
-	surf->iova_reserved = false;
+	if (surf->mm) {
+		mutex_lock(&isp->iovad_lock);
+		drm_mm_remove_node(surf->mm);
+		mutex_unlock(&isp->iovad_lock);
+		kfree(surf->mm);
+	}
+	surf->mm = NULL;
 }
 
-/*
- * The IOVA range starts at the top of the firmware heap. Hand out the lowest
- * free range of whole IOMMU pages above it.
- */
 static int isp_surf_reserve_iova(struct apple_isp *isp, struct isp_surf *surf)
 {
-	unsigned long first = DIV_ROUND_UP_ULL(isp->fw.heap_top, 1ULL << isp->shift);
-	unsigned long last = ((isp->fw.heap_top + isp->iova_size) >> isp->shift) - 1;
-	unsigned long pages = DIV_ROUND_UP_ULL(surf->size, 1ULL << isp->shift);
-	unsigned long index;
 	int err;
 
-	err = mtree_alloc_range(&isp->iovas, &index, surf, pages, first, last,
-				GFP_KERNEL);
+	surf->mm = kzalloc(sizeof(*surf->mm), GFP_KERNEL);
+	if (!surf->mm)
+		return -ENOMEM;
+
+	mutex_lock(&isp->iovad_lock);
+	err = drm_mm_insert_node_generic(&isp->iovad, surf->mm,
+					 ALIGN(surf->size, 1UL << isp->shift),
+					 1UL << isp->shift, 0, 0);
+	mutex_unlock(&isp->iovad_lock);
 	if (err < 0) {
 		dev_err(isp->dev, "failed to reserve 0x%llx of iova space\n",
 			surf->size);
-		return err;
+		goto mm_free;
 	}
 
-	surf->iova = (dma_addr_t)index << isp->shift;
-	surf->iova_reserved = true;
+	surf->iova = surf->mm->start;
 
 	return 0;
+mm_free:
+	kfree(surf->mm);
+	surf->mm = NULL;
+	return err;
 }
 
 static void isp_surf_iommu_unmap(struct apple_isp *isp, struct isp_surf *surf)
@@ -123,7 +129,7 @@ static int isp_surf_iommu_map(struct apple_isp *isp, struct isp_surf *surf)
 static void __isp_surf_init(struct apple_isp *isp, struct isp_surf *surf,
 			    u64 size, bool gc)
 {
-	surf->iova_reserved = false;
+	surf->mm = NULL;
 	surf->virt = NULL;
 	surf->size = ALIGN(size, 1UL << isp->shift);
 	surf->num_pages = surf->size >> isp->shift;
@@ -175,11 +181,8 @@ struct isp_surf *__isp_alloc_surface(struct apple_isp *isp, u64 size, bool gc)
 	}
 
 	refcount_set(&surf->refcount, 1);
-	if (surf->gc) {
-		mutex_lock(&isp->gc_lock);
+	if (surf->gc)
 		list_add_tail(&surf->head, &isp->gc);
-		mutex_unlock(&isp->gc_lock);
-	}
 
 	return surf;
 
@@ -212,35 +215,6 @@ struct isp_surf *isp_alloc_surface_vmap(struct apple_isp *isp, u64 size)
 	return surf;
 }
 
-/* A surface at a fixed IOVA, outside the range the others come from. */
-struct isp_surf *isp_alloc_surface_at(struct apple_isp *isp, dma_addr_t iova,
-				      u64 size)
-{
-	struct isp_surf *surf;
-
-	surf = kzalloc_obj(*surf);
-	if (!surf)
-		return NULL;
-
-	__isp_surf_init(isp, surf, size, false);
-	surf->iova = iova;
-
-	if (isp_surf_alloc_pages(surf) < 0)
-		goto free_surf;
-
-	if (isp_surf_iommu_map(isp, surf) < 0)
-		goto free_pages;
-
-	refcount_set(&surf->refcount, 1);
-	return surf;
-
-free_pages:
-	isp_surf_free_pages(surf);
-free_surf:
-	kfree(surf);
-	return NULL;
-}
-
 void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf)
 {
 	if (refcount_dec_and_test(&surf->refcount)) {
@@ -248,33 +222,9 @@ void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf)
 		isp_surf_iommu_unmap(isp, surf);
 		isp_surf_unreserve_iova(isp, surf);
 		isp_surf_free_pages(surf);
-		if (surf->gc) {
-			mutex_lock(&isp->gc_lock);
+		if (surf->gc)
 			list_del(&surf->head);
-			mutex_unlock(&isp->gc_lock);
-		}
 		kfree(surf);
-	}
-}
-
-/*
- * Free the SHAREDMALLOC surfaces the firmware has released. Only call this
- * once the firmware no longer uses them: after the stream that released them
- * has stopped, or after the firmware has stopped.
- */
-void isp_free_released_surfaces(struct apple_isp *isp)
-{
-	struct isp_surf *surf, *tmp;
-	LIST_HEAD(released);
-
-	mutex_lock(&isp->gc_lock);
-	list_splice_init(&isp->gc_released, &released);
-	mutex_unlock(&isp->gc_lock);
-
-	list_for_each_entry_safe(surf, tmp, &released, head) {
-		isp_dbg(isp, "shared surface freed: iova %pad size 0x%llx\n",
-			&surf->iova, surf->size);
-		isp_free_surface(isp, surf);
 	}
 }
 
@@ -285,7 +235,7 @@ int apple_isp_iommu_map_sgt(struct apple_isp *isp, struct isp_surf *surf,
 	ssize_t mapped;
 
 	// TODO userptr sends unaligned sizes
-	surf->iova_reserved = false;
+	surf->mm = NULL;
 	surf->size = size;
 
 	err = isp_surf_reserve_iova(isp, surf);

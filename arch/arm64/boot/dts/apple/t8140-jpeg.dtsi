@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/ {
+    soc {
+        jpeg_dart: iommu@28d020000 {
+            compatible = "apple,t8140-dart", "apple,t8110-dart";
+            reg = <0x2 0x8d020000 0 0xc000>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 1041 IRQ_TYPE_LEVEL_HIGH>;
+            power-domains = <&ps_jpg>;
+            #iommu-cells = <1>;
+            apple,dma-range = <0x100 0x4000 0 0x0fffc000>;
+        };
+        jpeg: image-codec@28d000000 {
+            compatible = "apple,t8140-jpeg-test";
+            reg = <0x2 0x8d000000 0 0x4000>;
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 1040 IRQ_TYPE_LEVEL_HIGH>;
+            power-domains = <&ps_jpg>;
+            iommus = <&jpeg_dart 0>;
+        };
+    };
+};

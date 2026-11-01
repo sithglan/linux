@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J873 capture074: shared SBR controller, exclusively own PMP SID6.
+ * The loader validates ADT geometry and exports the native tunable bytes
+ * before enabling these nodes. PMP is a manually loaded diagnostic module.
+ */
+/ {
+    soc {
+        pmp_dart: iommu@318100000 {
+            compatible = "apple,t8152-pmp-dart";
+            reg = <3 0x18100000 0 0xc000>;
+            #iommu-cells = <1>;
+            apple,dma-range = <0x100 0x40000000 0 0x40000000>;
+            status = "disabled";
+        };
+        pmp_mbox: mailbox@316020000 {
+            compatible = "apple,t8152-pmp-mailbox";
+            reg = <3 0x16020000 0 0x80>;
+            #mbox-cells = <0>;
+            status = "disabled";
+        };
+        pmp: pmp@300500000 {
+            compatible = "apple,t8152-pmp-v2";
+            reg = <3 0x00500000 0 0xd0000>, <3 0x00e00000 0 0x74000>;
+            reg-names = "pmp", "asc";
+            mboxes = <&pmp_mbox>;
+            iommus = <&pmp_dart 6>;
+            status = "disabled";
+        };
+    };
+};

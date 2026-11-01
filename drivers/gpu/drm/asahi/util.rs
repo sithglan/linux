@@ -110,35 +110,20 @@ impl<'a> Reader<'a> {
 
     pub(crate) fn read_up_to<T: AnyBitPattern>(&mut self, declared_size: usize) -> Result<T> {
         let mut obj: T = Default::default();
-        let size: usize = core::mem::size_of::<T>().min(declared_size);
+        let copy_size = core::mem::size_of::<T>().min(declared_size);
         let end = self.offset.checked_add(declared_size).ok_or(EINVAL)?;
         let range = self.offset..end;
         let src = self.buffer.get(range).ok_or(EINVAL)?;
 
         // SAFETY: The output pointer is valid, and the size does not exceed
         // the type size, and all bit patterns are valid.
-        let dst = unsafe { core::slice::from_raw_parts_mut(&mut obj as *mut _ as *mut u8, size) };
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(&mut obj as *mut _ as *mut u8, copy_size)
+        };
 
-        dst.copy_from_slice(&src[..size]);
+        dst.copy_from_slice(&src[..copy_size]);
         self.offset = end;
         Ok(obj)
-    }
-
-    /// Reads a record like [`Self::read_up_to`], for a path that implements only the first
-    /// `supported` bytes of `T`. Any nonzero byte of the declared record from `supported` on,
-    /// whether in a field this path does not implement or in a tail beyond `T`, fails with
-    /// `EINVAL` instead of being ignored.
-    pub(crate) fn read_supported<T: AnyBitPattern>(
-        &mut self,
-        declared_size: usize,
-        supported: usize,
-    ) -> Result<T> {
-        let end = self.offset.checked_add(declared_size).ok_or(EINVAL)?;
-        let record = self.buffer.get(self.offset..end).ok_or(EINVAL)?;
-        if record.iter().skip(supported).any(|byte| *byte != 0) {
-            return Err(EINVAL);
-        }
-        self.read_up_to(declared_size)
     }
 
     pub(crate) fn read<T: Default + AnyBitPattern>(&mut self) -> Result<T> {
@@ -173,47 +158,36 @@ mod tests {
     unsafe impl AnyBitPattern for u32 {}
 
     #[test]
-    fn read_supported_accepts_zero_unsupported_fields_and_tail() {
-        let raw = [5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0];
+    fn read_up_to_copies_known_bytes_and_consumes_the_declared_stride() {
+        let raw = [
+            1, 0, 0, 0, 2, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd, 3, 0, 0, 0,
+        ];
         let mut reader = Reader::new(&raw);
-        let pair: Pair = reader.read_supported(12, 4).unwrap();
-        assert_eq!(pair.first, 5);
-        assert_eq!(pair.second, 0);
-        assert_eq!(reader.read::<u32>().unwrap(), 6);
-        assert!(reader.is_empty());
-    }
-
-    #[test]
-    fn read_supported_accepts_a_record_shorter_than_the_supported_part() {
-        let raw = [7, 0];
-        let mut reader = Reader::new(&raw);
-        let pair: Pair = reader.read_supported(2, 4).unwrap();
-        assert_eq!(pair.first, 7);
-        assert_eq!(pair.second, 0);
-        assert!(reader.is_empty());
-    }
-
-    #[test]
-    fn read_supported_rejects_an_unsupported_field() {
-        let raw = [1, 0, 0, 0, 0, 1, 0, 0];
-        let mut reader = Reader::new(&raw);
-        assert!(reader.read_supported::<Pair>(8, 4).is_err());
-    }
-
-    #[test]
-    fn read_supported_rejects_a_nonzero_tail_beyond_the_type() {
-        let raw = [1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0x80];
-        let mut reader = Reader::new(&raw);
-        assert!(reader.read_supported::<Pair>(12, 8).is_err());
-        let mut reader = Reader::new(&raw);
-        let pair: Pair = reader.read_supported(8, 8).unwrap();
+        let pair: Pair = reader.read_up_to(12).unwrap();
+        assert_eq!(pair.first, 1);
         assert_eq!(pair.second, 2);
+        assert_eq!(reader.read::<u32>().unwrap(), 3);
+        assert!(reader.is_empty());
     }
 
     #[test]
-    fn read_supported_rejects_a_truncated_record() {
-        let raw = [1, 0, 0, 0];
+    fn read_up_to_zero_extends_a_short_declared_record() {
+        let raw = [4, 0, 0, 0];
         let mut reader = Reader::new(&raw);
-        assert!(reader.read_supported::<Pair>(8, 8).is_err());
+        let pair: Pair = reader.read_up_to(4).unwrap();
+        assert_eq!(pair.first, 4);
+        assert_eq!(pair.second, 0);
+        assert!(reader.is_empty());
     }
+}
+
+/// Whether the per-submission diagnostic dumps are enabled.
+///
+/// These dumps are bring-up instrumentation: several dozen lines per
+/// submission. Leaving them unconditional costs measurable time at desktop
+/// frame rates and wraps the kernel ring buffer fast enough to lose the
+/// failure that is actually being diagnosed.
+#[inline]
+pub(crate) fn g17p_verbose() -> bool {
+    crate::module_parameters::g17p_verbose.value() != 0
 }

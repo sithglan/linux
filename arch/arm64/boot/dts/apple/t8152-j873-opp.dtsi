@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J873/T8152: the remaining CPU performance states. The base DTS exposes
+ * only the two lowest per cluster until cooling is qualified; these come
+ * from the 26A434 ADT pmgr voltage-states1-sram (E) and voltage-states5-sram
+ * (P/M). opp-level is the hardware pstate (table index + 2, the ADT
+ * cpu-perf-state0-index). The SMC thermal zones (75 C passive trips on
+ * every sensor) throttle both clusters through these states; the
+ * initramfs still boots with both clusters capped at their lowest OPP.
+ */
+
+&m6_e_opp {
+	opp-1584000000 { opp-hz = /bits/ 64 <1584000000>; opp-level = <4>; };
+	opp-1980000000 { opp-hz = /bits/ 64 <1980000000>; opp-level = <5>; };
+	opp-2304000000 { opp-hz = /bits/ 64 <2304000000>; opp-level = <6>; };
+	opp-2640000000 { opp-hz = /bits/ 64 <2640000000>; opp-level = <7>; };
+	opp-2940000000 { opp-hz = /bits/ 64 <2940000000>; opp-level = <8>; };
+};
+
+&m6_pm_opp {
+	opp-2040000000 { opp-hz = /bits/ 64 <2040000000>; opp-level = <4>; };
+	opp-2340000000 { opp-hz = /bits/ 64 <2340000000>; opp-level = <5>; };
+	opp-2640000000 { opp-hz = /bits/ 64 <2640000000>; opp-level = <6>; };
+	opp-2940000000 { opp-hz = /bits/ 64 <2940000000>; opp-level = <7>; };
+	opp-3216000000 { opp-hz = /bits/ 64 <3216000000>; opp-level = <8>; };
+	opp-3468000000 { opp-hz = /bits/ 64 <3468000000>; opp-level = <9>; };
+	opp-3696000000 { opp-hz = /bits/ 64 <3696000000>; opp-level = <10>; };
+	opp-3924000000 { opp-hz = /bits/ 64 <3924000000>; opp-level = <11>; };
+	opp-4092000000 { opp-hz = /bits/ 64 <4092000000>; opp-level = <12>; };
+	opp-4272000000 { opp-hz = /bits/ 64 <4272000000>; opp-level = <13>; };
+	opp-4416000000 { opp-hz = /bits/ 64 <4416000000>; opp-level = <14>; };
+	opp-4476000000 { opp-hz = /bits/ 64 <4476000000>; opp-level = <15>; };
+	opp-4512000000 { opp-hz = /bits/ 64 <4512000000>; opp-level = <16>; };
+	opp-4536000000 { opp-hz = /bits/ 64 <4536000000>; opp-level = <17>; };
+	opp-4584000000 { opp-hz = /bits/ 64 <4584000000>; opp-level = <18>; };
+	opp-4644000000 { opp-hz = /bits/ 64 <4644000000>; opp-level = <19>; };
+	opp-4692000000 { opp-hz = /bits/ 64 <4692000000>; opp-level = <20>; };
+	opp-4788000000 { opp-hz = /bits/ 64 <4788000000>; opp-level = <21>; };
+};

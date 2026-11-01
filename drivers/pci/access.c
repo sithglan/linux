@@ -13,6 +13,8 @@
  */
 
 DEFINE_RAW_SPINLOCK(pci_lock);
+/* T8140 PIODMA must release the config lock while waiting for its IRQ. */
+EXPORT_SYMBOL_GPL(pci_lock);
 
 /*
  * Wrappers for all PCI configuration access functions.  They just check

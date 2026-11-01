@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+#include <dt-bindings/leds/common.h>
+
+/* J813 ADT: fpwm0 channel 0, kbd-backlight default-hz = 25000.
+ * Gate 82 is FPWM0. Its SIO/AFISOCNI2 ancestors are virtual (no_ps),
+ * so they have no physical power-state providers to instantiate.
+ */
+/ {
+	led-controller {
+		compatible = "pwm-leds";
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+			default-state = "on";
+			default-brightness = <128>;
+		};
+	};
+};
+
+&{/soc} {
+	pmgr_keyboard: power-management@380700000 {
+		compatible = "apple,t8142-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		/* As on T8140: up to the ISP17a slots at +0x4000..+0x4060. */
+		reg = <3 0x80700000 0 0x14000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		ps_fpwm0: power-controller@330 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x330 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "fpwm0";
+		};
+	};
+
+	fpwm0: pwm@3a5040000 {
+		compatible = "apple,t8142-fpwm", "apple,s5l-fpwm";
+		reg = <3 0xa5040000 0 0x4000>;
+		power-domains = <&ps_fpwm0>;
+		clocks = <&clkref>;
+		#pwm-cells = <2>;
+	};
+};

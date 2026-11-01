@@ -12,6 +12,8 @@
 #define ISP_FRAME_RATE_MIN 15
 /* The nominal capture rate, in frames per second */
 #define ISP_FRAME_RATE_DEFAULT 30
+/* The fastest capture rate, in frames per second */
+#define ISP_FRAME_RATE_MAX 30
 
 int apple_isp_detect_camera(struct apple_isp *isp);
 

@@ -1,4 +1,17 @@
 # SPDX-License-Identifier: GPL-2.0
+dtb-$(CONFIG_ARCH_APPLE) += t8142-j813.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8142-j813-minimal.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8142-j813-nvme.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8142-j813-audio.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8142-j813-desktop.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8142-j813-wifi.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8152-j873g.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8132-j604.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8132-j623.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8132-j624.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8132-j713.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8132-j715.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8132-j773g.dtb
 dtb-$(CONFIG_ARCH_APPLE) += s5l8960x-j71.dtb
 dtb-$(CONFIG_ARCH_APPLE) += s5l8960x-j73.dtb
 dtb-$(CONFIG_ARCH_APPLE) += s5l8960x-j85m.dtb
@@ -116,3 +129,13 @@ dtb-$(CONFIG_ARCH_APPLE) += t8132-j773g.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8140-j700.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8142-j813.dtb
 dtb-$(CONFIG_ARCH_APPLE) += t8152-j873g.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8140-j700-hybrid.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8140-j700-qspi-quad.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8152-j873.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8152-j873-usb.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8152-j873-nvme.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8152-j873-pcie.dtb
+dtb-$(CONFIG_ARCH_APPLE) += t8152-j873-audio.dtb
+
+# J700 media diagnostics require a qualified AVE firmware handoff.
+dtb-$(CONFIG_ARCH_APPLE) += t8140-j700-encoding.dtb

@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Opt-in media diagnostic DT. Run AVE boot preflight before using this DT!
+ * The union loader aborts before Linux if AVE reservations cannot be made.
+ * This is the aurora/j700 configuration (t8140-j700-hybrid.dts) plus AVE;
+ * that tree deliberately has no AVE node. The default t8140-j700.dtb
+ * describes AVE itself for the Aurora m1n1 firmware handoff.
+ */
+#include "t8140-j700-hybrid.dts"
+#include "t8140-ave.dtsi"
+
+
+&ave_dart0 { apple,import-handoff; };
+&ave_dart1 { apple,import-handoff; };

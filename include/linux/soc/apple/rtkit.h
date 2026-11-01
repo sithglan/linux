@@ -40,12 +40,6 @@ struct apple_rtkit_shmem {
 	void *private;
 };
 
-/* A buffer already negotiated by the previous owner of a running session. */
-struct apple_rtkit_inherited_buffer {
-	u8 endpoint;
-	struct apple_rtkit_shmem shmem;
-};
-
 /*
  * The co-processor places its shared buffers itself. A buffer request that
  * carries an IOVA is set up with shmem_setup and acknowledged by sending the
@@ -53,9 +47,6 @@ struct apple_rtkit_inherited_buffer {
  * map is handled, before the map is acknowledged.
  */
 #define APPLE_RTKIT_COPROC_PLACES_BUFFERS	BIT(0)
-
-/* This client requires endpoint 7 setup before IOP power can be acknowledged. */
-#define APPLE_RTKIT_NEEDS_COREANALYTICS	BIT(1)
 
 /*
  * Struct to represent implementation-specific RTKit operations.
@@ -78,18 +69,9 @@ struct apple_rtkit_inherited_buffer {
  *                 descriptor pointer and do not change size: repeated
  *                 requests are matched against it. If not specified
  *                 dma_alloc_coherent is used. Called in process context.
- * @shmem_setup_ep: Endpoint-aware alternative to shmem_setup. Called with the
- *                 requesting system endpoint. Specify only one setup callback.
  * @shmem_destroy: Undo the shared memory buffer setup in shmem_setup. If not
  *                 specified dma_free_coherent is used. Called in process
  *                 context.
- * @syslog_is_debug:
- *                 Optional policy for a decoded, NUL-terminated syslog record.
- *                 Return true to log at debug instead of info. Called in
- *                 process context; strings are borrowed until return. Records
- *                 are acknowledged regardless of the chosen log level.
- * @protocol_version: Optional exact protocol version required by the client.
- *                 Zero retains normal highest-supported-version negotiation.
  */
 struct apple_rtkit_ops {
 	unsigned int flags;
@@ -97,10 +79,7 @@ struct apple_rtkit_ops {
 	void (*recv_message)(void *cookie, u8 endpoint, u64 message);
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
 	int (*shmem_setup)(void *cookie, struct apple_rtkit_shmem *bfr);
-	int (*shmem_setup_ep)(void *cookie, u8 endpoint, struct apple_rtkit_shmem *bfr);
 	void (*shmem_destroy)(void *cookie, struct apple_rtkit_shmem *bfr);
-	bool (*syslog_is_debug)(void *cookie, const char *context, const char *message);
-	u16 protocol_version;
 };
 
 struct apple_rtkit;
@@ -118,6 +97,11 @@ struct apple_rtkit;
 struct apple_rtkit *devm_apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
 					  const struct apple_rtkit_ops *ops);
+
+/* Device-managed form of apple_rtkit_init_adopted(). */
+struct apple_rtkit *devm_apple_rtkit_init_adopted(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops);
 /*
  * Frees internal RTKit state allocated by devm_apple_rtkit_init().
  *
@@ -143,7 +127,7 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 /*
  * Initialize an instance for a co-processor that the bootloader left running
  * and that cannot be reset. No HELLO/EPMAP handshake takes place: the system
- * endpoints are marked available and syslog/OSLog records are acknowledged without
+ * endpoints are marked available and syslog records are acknowledged without
  * being parsed. The caller must verify the device-specific running/ready
  * indicators before using the instance.
  */
@@ -152,15 +136,12 @@ struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 					     const struct apple_rtkit_ops *ops);
 
 /*
- * As above, with the previous owner's system buffers installed before mailbox
- * RX starts. The caller validates and maps their retained storage. Descriptors
- * are copied, but their backing storage must outlive the RTKit instance. No
- * buffer is allocated, renegotiated or freed if initialization fails.
+ * G17P owns its crash buffer in the GPU UAT. Preserve the firmware DVA and
+ * echo the request without attempting to map it through the device DMA API.
  */
-struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
-	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
-	const struct apple_rtkit_ops *ops,
-	const struct apple_rtkit_inherited_buffer *buffers, unsigned int count);
+struct apple_rtkit *apple_rtkit_init_g17p(struct device *dev, void *cookie,
+					  const char *mbox_name, int mbox_idx,
+					  const struct apple_rtkit_ops *ops);
 
 /*
  * Free an instance of apple_rtkit.
@@ -168,8 +149,8 @@ struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
 void apple_rtkit_free(struct apple_rtkit *rtk);
 
 /*
- * Detach a co-processor that is still running, or that could not be
- * quiesced, without releasing its shared buffers.
+ * Detach a co-processor that could not be quiesced without releasing its
+ * shared buffers.
  *
  * Stops mailbox callbacks and drains the private RTKit workqueue before
  * freeing the transport state. Firmware-visible mappings and their allocation
@@ -204,12 +185,15 @@ int apple_rtkit_adopt_running(struct apple_rtkit *rtk);
  */
 int apple_rtkit_quiesce(struct apple_rtkit *rtk);
 
+/* H17P only: wait for the separate idle fence after adopted IOP OFF. */
+int apple_rtkit_poweroff_adopted(struct apple_rtkit *rtk);
+
 /*
  * Wake the co-processor up from hibernation mode.
  */
 int apple_rtkit_wake(struct apple_rtkit *rtk);
 
-/* Wake helpers which require AP readiness before their IOP power acknowledgment. */
+/* For helpers that require AP=ON before their IOP power-state acknowledgement. */
 int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk);
 
 /*
@@ -270,28 +254,6 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
  * @rtk:            RTKit reference
  */
 int apple_rtkit_poll(struct apple_rtkit *rtk);
-
-/*
- * Stop taking interrupts for messages from the co-processor, which then
- * stay queued in the mailbox until apple_rtkit_resume_rx().
- */
-void apple_rtkit_hold_rx(struct apple_rtkit *rtk);
-void apple_rtkit_resume_rx(struct apple_rtkit *rtk);
-
-/*
- * Set the minimum utilization (0..1024, or -1 for the scheduler's default) of
- * the coprocessor's receive thread; see apple_mbox_set_rx_util_min().
- */
-int apple_rtkit_set_rx_util_min(struct apple_rtkit *rtk, int util_min);
-
-/*
- * Wait until the messages already received have been handled, including the
- * recv_message, crashed and shmem_setup callbacks the worker thread ran for
- * them. Must not be called from one of those callbacks.
- *
- * @rtk:            RTKit reference
- */
-void apple_rtkit_flush_rx(struct apple_rtkit *rtk);
 
 /*
  * Checks if an endpoint with a given index exists

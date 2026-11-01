@@ -7,51 +7,14 @@
 /* For mode parsing */
 #include <drm/drm_modes.h>
 
-#include "dcp-display-metadata.h"
-#include "dcp-metadata-epoch.h"
-
 struct apple_dcp;
-int parse_panel_edid_data(const void *blob, size_t len, const u8 **edid, size_t *size);
-typedef void (*dcp_identity_key_fn)(void *data, const char *key, u32 key_len,
-				    u32 type, u32 size, u32 depth);
-int parse_identity_keys(const void *blob, size_t len, dcp_identity_key_fn emit, void *data);
-struct apple_connector;
-struct apple_dcp_typec_route;
+struct dcp_dptx_caps;
 
 struct dcp_parse_ctx {
 	struct apple_dcp *dcp;
 	const void *blob;
 	u32 pos, len;
-	/* External H17P candidates require separate publication/lookup proof. */
-	bool automatic_1080p180_rgb8;
-	bool ambiguous_180hz;
-	/* Desktop 26.6 uses zero placeholders for an unreported VRR range. */
-	bool zero_vrr_range_fallback;
-	/*
-	 * A desktop 26.x external processor: read the sink timing keys that
-	 * describe the preferred timing for the firmware-derived EDID, without
-	 * the H17P external color policy.
-	 */
-	bool metadata_timing;
-#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-	/*
-	 * T6030 external processor audio elements (DCP firmware 14.7, external
-	 * role): an element's ElementData, the link data the audio service
-	 * takes, is 32 bytes.
-	 */
-	bool v14_7_audio;
-#endif
 };
-
-/* The T6030 external processor's audio elements (DRM_APPLE_DCP_T6030_AUDIO only). */
-static inline bool dcp_parse_v14_7_audio(const struct dcp_parse_ctx *ctx)
-{
-#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-	return ctx->v14_7_audio;
-#else
-	return false;
-#endif
-}
 
 enum dcp_color_eotf {
 	DCP_EOTF_SDR_GAMMA = 0, // "SDR gamma"
@@ -131,100 +94,24 @@ struct dcp_display_mode {
 	struct dcp_color_mode sdr_444;
 	struct dcp_color_mode sdr;
 	struct dcp_color_mode best;
-	/* The timing's PQ BT.2020 element, usable without DSC (score -1 if none) */
-	struct dcp_color_mode pq;
 	bool vrr;
-	/* ProMotion fixed timings still need presentation deadlines. */
-	bool needs_timestamps;
-	/* IsPreferred, outside the external SDR path */
-	bool preferred;
-	bool metadata_timing_valid;
-	bool automatic_rgb8_quirk;
-	/* IsPreferred on every path; an external display's native resolution */
-	bool firmware_preferred;
-	/* An SDR color element that is neither unsafe nor DSC only */
-	bool sdr_usable;
-	/* The firmware score of the timing */
-	s64 score;
-	/* The sync polarity flags of the timing, if it reports them */
-	u32 metadata_sync_flags;
-	/*
-	 * The best virtual color element of the timing, which the desktop
-	 * 26.x firmware selects first to bootstrap its generic pipe (valid if
-	 * has_bootstrap).  Both sit in what was padding.
-	 */
-	u32 bootstrap_color_id;
-	u64 automatic_connection_sequence;
-	u64 automatic_catalog_sequence;
-	bool automatic_service_pending;
-	bool has_bootstrap;
-	/* Immutable receipt provenance; never retag a cached exception. */
-	struct dcp_metadata_ticket unsafe_rgb8_ticket;
-	u64 unsafe_rgb8_service_epoch;
 };
 
 struct dimension {
 	s64 total, front_porch, sync_width, active;
 	s64 precise_sync_rate;
-	s64 sync_polarity;
-	s64 pixel_repetition;
 };
 
-/*
- * Upper bound on the TimingElements catalog. DCP reports one element per
- * timing it derived from the sink's EDID and DisplayID, and every catalog
- * logged on J700 so far holds at most 14. The cap leaves ample headroom
- * while keeping the retained array (320 bytes per entry) below 1 MiB.
- */
-#define DCP_MAX_TIMING_MODES 1024
-
 int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx);
-bool dcp_property_complete(const void *blob, size_t received, size_t advertised);
-#if IS_ENABLED(CONFIG_KUNIT)
-bool dcp_mode_default_above(const struct dcp_display_mode *mode, s64 score,
-			    const struct dcp_display_mode *best, s64 best_score);
-bool dcp_mode_ranks_above(bool preferred, s64 score, bool best_preferred,
-			  s64 best_score);
-#endif
-
 struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
 					 int height_mm, unsigned notch_height,
-					 bool internal, bool external_sdr);
-int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out);
-/* Caller holds modes_lock while checking connector ownership. */
-bool dcp_modes_for_connector(struct apple_dcp *dcp,
-			     struct apple_connector *connector);
-void dcp_modes_begin_attachment(struct apple_dcp *dcp);
-struct dcp_display_mode *dcp_modes_dup(struct apple_dcp *dcp,
-				       struct apple_connector *connector,
-				       unsigned int *count, u64 *generation);
-void dcp_modes_adopt(struct apple_dcp *dcp, struct apple_connector *connector,
-		     u64 generation, struct dcp_display_mode *modes,
-		     unsigned int count);
-bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *route);
-void dcp_modes_init(struct apple_dcp *dcp);
-void dcp_modes_release(void *data);
-int dcp_attributes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
-			   u64 generation);
-u64 dcp_modes_transfer_begin(struct apple_dcp *dcp);
-int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
-		      u64 generation);
-
-int parse_array_count(const struct dcp_parse_ctx *handle, u32 *count);
-
-/* Caller serializes readers against replacement. */
-int replace_modes(struct dcp_parse_ctx *handle,
-		  struct dcp_display_mode **modes, unsigned int *count,
-		  int width_mm, int height_mm, unsigned int notch_height,
-		  bool internal);
-int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out);
-int parse_panel_product_metadata(struct dcp_parse_ctx *handle,
-				 struct dcp_display_metadata *out);
+					 bool internal);
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
-			     int *height_mm, bool *backlight_control);
+			     int *height_mm);
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			    const char **class, s64 *unit, bool h17p_keys);
+int parse_dptx_caps(struct dcp_parse_ctx *handle, struct dcp_dptx_caps *caps);
 
 struct dcp_sound_format_mask {
 	u64 formats;			/* SNDRV_PCM_FMTBIT_* */
@@ -232,20 +119,8 @@ struct dcp_sound_format_mask {
 	unsigned int nchans;
 };
 
-/*
- * An audio element's ElementData, the link data of the audio service's link
- * methods: 24 bytes up to DCP firmware 13.5, 32 on the 14.7 external role.
- */
-#define DCP_SOUND_COOKIE_SIZE		24
-#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-#define DCP_SOUND_COOKIE_SIZE_V14_7	32
-#define DCP_SOUND_COOKIE_MAX		DCP_SOUND_COOKIE_SIZE_V14_7
-#else
-#define DCP_SOUND_COOKIE_MAX		DCP_SOUND_COOKIE_SIZE
-#endif
-
 struct dcp_sound_cookie {
-	u8 data[DCP_SOUND_COOKIE_MAX];
+	u8 data[24];
 };
 
 struct snd_pcm_chmap_elem;

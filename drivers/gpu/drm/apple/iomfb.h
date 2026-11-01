@@ -15,6 +15,7 @@
 enum dcp_context_id {
 	/* Callback */
 	DCP_CONTEXT_CB = 0,
+	DCP_CONTEXT_ASYNC_CB = 1,
 
 	/* Command */
 	DCP_CONTEXT_CMD = 2,
@@ -24,6 +25,7 @@ enum dcp_context_id {
 
 	/* Out-of-band callback */
 	DCP_CONTEXT_OOBCB = 4,
+	DCP_CONTEXT_OOBASYNC_CB = 5,
 
 	/* Out-of-band command */
 	DCP_CONTEXT_OOBCMD = 6,
@@ -78,8 +80,7 @@ struct dcp_packet_header {
 #define DCP_PACKET_ALIGNMENT (0x40)
 
 enum iomfb_property_id {
-    IOMFB_PROPERTY_NITS_V13_3 = 15, // divide by Brightness_Scale
-    IOMFB_PROPERTY_NITS_V14_7 = 19,
+    IOMFB_PROPERTY_NITS = 15, // divide by Brightness_Scale
 };
 
 #define IOMFB_BRIGHTNESS_MIN 0x10000000
@@ -184,6 +185,8 @@ enum dcpep_method {
 	 * H17P pipe-configuration calls made before the first swap.  Most
 	 * names are unknown; they are identified by method number.
 	 */
+	dcpep_pipe_query_353,
+	dcpep_pipe_set_352,
 	dcpep_pipe_cfg_415,
 	dcpep_pipe_cfg_031,
 	dcpep_pipe_cfg_414,
@@ -212,8 +215,6 @@ bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
 bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
 			       u32 out_len);
-/* Desktop 26.6: does the record hold what the tag's handler reads and writes? */
-bool iomfb_check_callback_v26_6_desktop(int tag, u32 in_len, u32 out_len);
 
 typedef bool (*iomfb_cb_handler)(struct apple_dcp *, int, void *, void *);
 
@@ -406,90 +407,6 @@ struct dcpep_get_tiling_state_req {
 struct dcpep_get_tiling_state_resp {
 	u32 value;
 	u32 ret;
-} __packed;
-
-/*
- * Records of the desktop 26.6 IOMFB (T6041, DCP_FIRMWARE_V_26_6_DESKTOP)
- * that differ from the shared ones above.
- */
-
-/* A364 get_mode_info: fills the mode record A413 then selects. */
-struct dcp_get_mode_info_req_v26_6 {
-	u8 mode[0x64];
-	u8 mode_null;
-	u8 padding0[3];
-	u64 opaque;
-	u32 timing_mode_id;
-	u32 color_mode_id;
-	u8 result_null;
-	u8 padding1[3];
-} __packed;
-
-struct dcp_get_mode_info_resp_v26_6 {
-	u8 opaque[0x74];
-} __packed;
-
-/* A469 abort_swaps_dcp takes the bare client identity. */
-struct iomfb_abort_swaps_dcp_req_v26_6 {
-	u64 client;
-} __packed;
-
-struct iomfb_abort_swaps_dcp_resp_v26_6 {
-	u32 ret;
-} __packed;
-
-/* D592 swap_complete_intent_gated, padded to 0x14. */
-struct dcp_swap_complete_intent_gated_v26_6 {
-	u32 swap_id;
-	u8 unkBool;
-	u32 unkInt;
-	u32 width;
-	u32 height;
-	u8 padding[3];
-} __packed;
-
-/* D125 read_edt_data reply, padded to 0x24. */
-struct dcp_read_edt_data_resp_v26_6 {
-	u32 value[8];
-	u8 ret;
-	u8 padding[3];
-} __packed;
-
-/*
- * D575 hotplug_gated: the connection state and a tiled-display record in,
- * a 0x4c-byte record out.
- */
-struct dcp_hotplug_req_v26_6 {
-	u64 connected;
-	u8 opaque[0x50];
-} __packed;
-
-struct dcp_hotplug_resp_v26_6 {
-	u8 opaque[0x4c];
-} __packed;
-
-/* A boolean argument, padded to four bytes. */
-struct dcp_bool_arg {
-	u8 value;
-	u8 padding[3];
-} __packed;
-
-/*
- * A420 get_gamma_table / A421 set_gamma_table: three channels (red, green,
- * blue) of 257 u32 entries followed by a null flag, 3088 bytes in and out.
- */
-#define IOMFB_GAMMA_ENTRIES 257
-
-struct iomfb_gamma_table_req {
-	__le32 table[3][IOMFB_GAMMA_ENTRIES];
-	u8 table_null;
-	u8 padding[3];
-} __packed;
-
-struct iomfb_gamma_table_resp {
-	__le32 table[3][IOMFB_GAMMA_ENTRIES];
-	u8 table_null;
-	u8 padding[3];
 } __packed;
 
 #endif

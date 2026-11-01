@@ -492,6 +492,8 @@ struct SndSocT8140AopData {
     hpai_want_run: AtomicFlag,
     /// "Speaker Playback Volume" (REG_SPKR_VOLUME), 0..=SPKR_VOLUME_MAX.
     spkr_volume: Atomic<u32>,
+    /// User gain within the independently controlled speaker safety ceiling.
+    spkr_user_volume: Atomic<u32>,
     /// The sleeping firmware starts queued from the atomic triggers.
     #[pin]
     spkr_start_work: Work<Self, SPKR_START_WORK>,
@@ -1653,6 +1655,7 @@ const SPKR_VOLUME_Q31: [u32; 128] = [
 ];
 /// The component's only "register": the speaker volume.
 const REG_SPKR_VOLUME: u32 = 0;
+const REG_SPKR_USER_VOLUME: u32 = 1;
 /// DECLARE_TLV_DB_SCALE(-6350, 50, 1): a dB scale from -63.50 dB in 0.50 dB
 /// steps whose lowest value mutes.
 static SPKR_VOLUME_TLV: [u32; 4] = [
@@ -2030,7 +2033,8 @@ unsafe extern "C" fn asoc_pcm_copy(
     // throughout registration, use and unregister.
     let data = unsafe { component_data(component) };
     let volume = core::cmp::min(data.spkr_volume.load(Relaxed), SPKR_VOLUME_MAX) as usize;
-    let gain = SPKR_VOLUME_Q31[volume];
+    let user_volume = core::cmp::min(data.spkr_user_volume.load(Relaxed), 100);
+    let gain = ((SPKR_VOLUME_Q31[volume] as u64 * user_volume as u64) / 100) as u32;
     let mut chunk = [0u8; 512];
     let mut off = 0;
     while off < bytes {
@@ -2127,6 +2131,7 @@ unsafe extern "C" fn asoc_component_read(
     let data = unsafe { component_data(component) };
     match reg {
         REG_SPKR_VOLUME => data.spkr_volume.load(Relaxed),
+        REG_SPKR_USER_VOLUME => data.spkr_user_volume.load(Relaxed),
         _ => 0,
     }
 }
@@ -2147,6 +2152,10 @@ unsafe extern "C" fn asoc_component_write(
         REG_SPKR_VOLUME => {
             data.spkr_volume
                 .store(core::cmp::min(val, SPKR_VOLUME_MAX), Relaxed);
+            0
+        }
+        REG_SPKR_USER_VOLUME => {
+            data.spkr_user_volume.store(core::cmp::min(val, 100), Relaxed);
             0
         }
         _ => EINVAL.to_errno(),
@@ -2477,9 +2486,10 @@ struct AsocContext {
     data: Arc<SndSocT8140AopData>,
     dais: KBox<Opaque<[bindings::snd_soc_dai_driver; DAI_COUNT]>>,
     _ops: KBox<DaiOps>,
-    _controls: KBox<[bindings::snd_kcontrol_new; 1]>,
+    _controls: KBox<[bindings::snd_kcontrol_new; 2]>,
     // The C mixer helpers modify platform_max under their control locks.
     _volume: KBox<Opaque<bindings::soc_mixer_control>>,
+    _user_volume: KBox<Opaque<bindings::soc_mixer_control>>,
 }
 
 const _: () = assert!(mem::offset_of!(AsocContext, component) == 0);
@@ -2499,6 +2509,17 @@ impl AsocContext {
             }),
             GFP_KERNEL,
         )?;
+        let user_volume = KBox::new(
+            Opaque::new(bindings::soc_mixer_control {
+                min: 0,
+                max: 100,
+                platform_max: 100,
+                reg: REG_SPKR_USER_VOLUME as i32,
+                rreg: REG_SPKR_USER_VOLUME as i32,
+                ..Default::default()
+            }),
+            GFP_KERNEL,
+        )?;
         // SOC_SINGLE_TLV("Speaker Playback Volume", REG_SPKR_VOLUME, 0, 127, 0, tlv)
         let controls = KBox::new(
             [bindings::snd_kcontrol_new {
@@ -2514,6 +2535,15 @@ impl AsocContext {
                 },
                 private_value: volume.get() as usize,
                 ..Default::default()
+            }, bindings::snd_kcontrol_new {
+                iface: bindings::BINDINGS_SNDRV_CTL_ELEM_IFACE_MIXER,
+                name: c"Speaker User Playback Volume".as_char_ptr(),
+                access: bindings::SNDRV_CTL_ELEM_ACCESS_READWRITE,
+                info: Some(bindings::snd_soc_info_volsw),
+                get: Some(bindings::snd_soc_get_volsw),
+                put: Some(bindings::snd_soc_put_volsw),
+                private_value: user_volume.get() as usize,
+                ..Default::default()
             }],
             GFP_KERNEL,
         )?;
@@ -2522,7 +2552,7 @@ impl AsocContext {
             read: Some(asoc_component_read),
             write: Some(asoc_component_write),
             controls: controls.as_ptr(),
-            num_controls: 1,
+            num_controls: 2,
             open: Some(asoc_pcm_open),
             close: Some(asoc_pcm_close),
             hw_params: Some(asoc_pcm_hw_params),
@@ -2541,6 +2571,7 @@ impl AsocContext {
                 _ops: ops,
                 _controls: controls,
                 _volume: volume,
+                _user_volume: user_volume,
             },
             GFP_KERNEL,
         )?)
@@ -2881,6 +2912,7 @@ impl SndSocT8140AopDriver {
                 spkr_want_run: AtomicFlag::new(false),
                 hpai_want_run: AtomicFlag::new(false),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
+                spkr_user_volume: Atomic::new(100),
                 spkr_start_work <- new_work!("SndSocT8140AopData::spkr_start_work"),
                 hpai_start_work <- new_work!("SndSocT8140AopData::hpai_start_work"),
                 mic,

@@ -2,18 +2,60 @@
 config WLAN_VENDOR_APPLE
 	bool "Apple wireless devices"
 	default y
+	help
+	  Support for Apple's wireless network devices.
 
 if WLAN_VENDOR_APPLE
 config APPLE_CENTAURI
-	tristate "Apple N1 Centauri firmware and IPC transport"
+	tristate "Apple N1 Centauri Wi-Fi"
 	depends on ARCH_APPLE || COMPILE_TEST
-	depends on PCI && CFG80211 && PCIE_APPLE_APIF
+	depends on PCI && CFG80211
+	depends on DEBUG_FS || PCIE_APPLE_APIF
 	select FW_LOADER
 	help
-	  Boot the shared N1 firmware and establish its PCI DMA contexts.
-	  Requires a preinitialized APIF host with the supported reset layout
-	  and DT-supplied personalized firmware name and platform identifier.
-	  The endpoint must start in the stopped ROM personality. Firmware
-	  and per-device calibration are external inputs and are not included.
+	  Apple N1 Wi-Fi. Two drivers share this option, and each binds only
+	  on its own PCIe host: the native Apple PCIe host of the J813 and
+	  J873 (APPLE_CENTAURI_NATIVE, needs DEBUG_FS) and the APIF guest host
+	  of the T6050 (built when PCIE_APPLE_APIF is enabled).
 
+	  The firmware and per-device calibration are private external inputs.
+
+	  To build as a module, choose M. The native module is apple_centauri.
+	  The APIF module is apple_centauri too, or apple_centauri_apif when
+	  both drivers are built.
+
+config APPLE_CENTAURI_NATIVE
+	bool "N1 on the native Apple PCIe host (J813, J873)"
+	depends on APPLE_CENTAURI && DEBUG_FS
+	default y if PCIE_APPLE_APIF = n
+	help
+	  Experimental Apple N1 PCIe and ACIPC Wi-Fi support for the J813
+	  MacBook Air. Firmware boot, ring setup and connection setup currently
+	  use debugfs and the tools/aurora/j813 workbench. The tested single-link
+	  WPA2 setup completes DHCP and bidirectional traffic. Suspend/resume,
+	  roaming and automatic startup are not yet qualified.
+
+	  This driver does not include Bluetooth HCI support (BT_CENTAURI).
+	  It refuses functions behind an APIF host. It is on by default
+	  unless PCIE_APPLE_APIF is enabled; say Y to build it next to the
+	  APIF driver.
+
+# N1 firmware and IPC transport over an APIF guest PCI host (T6050). It boots
+# the shared N1 firmware and establishes its PCI DMA contexts. It requires a
+# preinitialized APIF host with the supported reset layout and DT-supplied
+# personalized firmware name and platform identifier. The endpoint must start
+# in the stopped ROM personality. Firmware and per-device calibration are
+# external inputs and are not included.
+config APPLE_CENTAURI_APIF
+	def_tristate APPLE_CENTAURI
+	depends on APPLE_CENTAURI && PCIE_APPLE_APIF
+
+config APPLE_CENTAURI_WIFI
+	bool "N1 Centauri cfg80211 station interface"
+	depends on APPLE_CENTAURI_APIF
+	default y
+	help
+	  Add Alpha command/data rings, scanning and WPA2-PSK/CCMP station
+	  connections for the explicitly matched firmware protocol profile.
+	  Radio firmware and calibration remain external inputs.
 endif

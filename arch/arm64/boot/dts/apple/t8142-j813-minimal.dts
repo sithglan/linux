@@ -1,0 +1,157 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J813/T8142 first Linux boot: resources measured from the live Apple ADT.
+ * Deliberately includes only CPU, interrupt, console, and framebuffer devices.
+ * Memory, CPU release addresses, and framebuffer are filled by m1n1.
+ *
+ * This is the aurora/j813 base tree: the loader's minimal boot path
+ * (aurora,minimal-boot), the Samsung UART enabled and the firmware CPU
+ * names. t8142-j813-wifi.dts and the trees built on it extend this file.
+ * t8142-j813.dts is the native-FDT-handoff tree with cpufreq, display,
+ * peripherals and USB.
+ */
+/dts-v1/;
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+/ {
+	compatible = "apple,j813", "apple,t8142", "apple,arm-platform";
+	model = "Apple MacBook Air (M5, J813)";
+	aurora,minimal-boot;
+	#address-cells = <2>;
+	#size-cells = <2>;
+	interrupt-parent = <&aic>;
+
+	aliases { serial0 = &dockchannel; serial1 = &serial0; };
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		stdout-path = "serial0:1500000n8";
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>;
+			status = "disabled";
+		};
+	};
+	reserved-memory { #address-cells = <2>; #size-cells = <2>; ranges; };
+	memory@10000000000 { device_type = "memory"; reg = <0x100 0 0x4 0>; };
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+		cpu0: cpu@0 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x0>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+		cpu1: cpu@1 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x1>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+		cpu2: cpu@2 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x2>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+		cpu3: cpu@3 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x3>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+		cpu4: cpu@4 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x4>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+		cpu5: cpu@5 {
+			compatible = "apple,sawtooth";
+			device_type = "cpu";
+			reg = <0 0x5>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+		/* P0 MPIDR_EL1 is 0x80010100; ADT reg omits the affinity-2 bit. */
+		cpu6: cpu@10100 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x10100>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+		cpu7: cpu@10101 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x10101>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+		cpu8: cpu@10102 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x10102>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+		cpu9: cpu@10103 {
+			compatible = "apple,everest";
+			device_type = "cpu";
+			reg = <0 0x10103>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>;
+		};
+	};
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+	};
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+	};
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+		aic: interrupt-controller@381000000 {
+			compatible = "apple,t8142-aic3", "apple,t8122-aic3";
+			interrupt-controller;
+			#interrupt-cells = <3>;
+			#address-cells = <0>;
+			reg = <3 0x81000000 0 0x1cc000>, <3 0x81040000 0 0x4000>;
+			reg-names = "core", "event";
+		};
+		serial0: serial@3a5200000 {
+			compatible = "apple,s5l-uart";
+			reg = <3 0xa5200000 0 0x4000>;
+			reg-io-width = <4>;
+			interrupts = <AIC_IRQ 1231 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+		};
+		dockchannel: serial@38812c000 {
+			compatible = "apple,dockchannel-uart";
+			reg = <3 0x8812c000 0 0x4000>,
+			      <3 0x88128000 0 0x4000>,
+			      <3 0x8810c000 0 0x1000>;
+			reg-names = "data", "config", "irq";
+			interrupts = <AIC_IRQ 571 IRQ_TYPE_LEVEL_HIGH>;
+			status = "okay";
+		};
+	};
+};

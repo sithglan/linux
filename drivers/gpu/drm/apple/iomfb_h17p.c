@@ -8,7 +8,6 @@
 #include "iomfb_h17p.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
-#include "iomfb_v14_7_tpl.h"
 #include "version_utils.h"
 
 struct dcp_callback_size {
@@ -168,30 +167,37 @@ static u64 iomfb_nits_binary64_h17p(u32 nits)
 	return value;
 }
 
-void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits,
-				 u32 maximum, bool update)
+/* @swap is the swap record of a present; H17G sends it unserialized. */
+void iomfb_encode_backlight_swap_h17p(u8 *swap, u32 nits, u32 maximum,
+				      bool update)
 {
 	u64 ceiling = iomfb_nits_binary64_h17p(maximum);
 	u64 unity = iomfb_nits_binary64_h17p(1);
 
 	/* This profile does not use the older DAC/power words. */
-	memset(wire->swap + 0x32f, 0, 0xd);
-	memset(wire->swap + 0x354, 0, 0x9a);
+	memset(swap + 0x32f, 0, 0xd);
+	memset(swap + 0x354, 0, 0x9a);
 	/* The ceiling pair must remain valid even on a brightness-idle frame. */
-	put_unaligned_le64(ceiling, wire->swap + 0x36e);
-	put_unaligned_le64(ceiling, wire->swap + 0x376);
+	put_unaligned_le64(ceiling, swap + 0x36e);
+	put_unaligned_le64(ceiling, swap + 0x376);
 	if (!update)
 		return;
 
 	/* Linux brightness changes and soft DPMS use the same activation bytes. */
-	put_unaligned_le32(1, wire->swap + 0x354);
-	wire->swap[0x358] = 1;
-	wire->swap[0x359] = 1;
-	wire->swap[0x35a] = 1;
-	put_unaligned_le16(1, wire->swap + 0x35c);
-	put_unaligned_le64(iomfb_nits_binary64_h17p(nits), wire->swap + 0x35e);
-	put_unaligned_le64(unity, wire->swap + 0x37e);
-	put_unaligned_le64(unity, wire->swap + 0x3e6);
+	put_unaligned_le32(1, swap + 0x354);
+	swap[0x358] = 1;
+	swap[0x359] = 1;
+	swap[0x35a] = 1;
+	put_unaligned_le16(1, swap + 0x35c);
+	put_unaligned_le64(iomfb_nits_binary64_h17p(nits), swap + 0x35e);
+	put_unaligned_le64(unity, swap + 0x37e);
+	put_unaligned_le64(unity, swap + 0x3e6);
+}
+
+void iomfb_encode_backlight_h17p(struct dcp_present_h17p *wire, u32 nits,
+				 u32 maximum, bool update)
+{
+	iomfb_encode_backlight_swap_h17p(wire->swap, nits, maximum, update);
 }
 
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
@@ -308,11 +314,14 @@ static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
 static bool trampoline_analytics_h17p(struct apple_dcp *dcp, int tag,
 				      void *out, void *in)
 {
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
-		return trampoline_zero(dcp, tag, out, in);
-
+	/*
+	 * H17G (M5) needs the same empty dictionary. A zeroed reply fails the
+	 * firmware's OSDictionary deserialization ("OSDictionary
+	 * deserialization failed" in the DCP crash log) and the DCP panics
+	 * with "app NMI" one hour after boot.
+	 */
 	trace_iomfb_callback(dcp, tag, __func__);
-	/* The dispatcher has validated the D114 reply size. */
+	/* The dispatcher has validated the measured D114 reply size. */
 	memset(out, 0, 0x1004);
 	*(u8 *)out = 'd';
 	return true;
@@ -391,7 +400,7 @@ static const u8 j700_provider_data_4[] = {
 	0xa2, 0x19, 0x00, 0x00
 };
 
-/* Only these provider transfers are known to match the disp0 ADT. */
+/* Only these provider transfers have been measured against the disp0 ADT. */
 static const struct dcp_h17p_provider_property provider_properties[] = {
 	{ "power-lut-data-x", "apple,power-lut-data-x", 4, j700_provider_data_0 },
 	{ "power-lut-data-y", "apple,power-lut-data-y", 4, j700_provider_data_1 },
@@ -435,27 +444,23 @@ static bool trampoline_provider_property_h17p(struct apple_dcp *dcp, int tag,
 	trace_iomfb_callback(dcp, tag, __func__);
 	property = dcp_provider_property_h17p(in);
 	if (!property) {
-		dev_err(dcp->dev, "unsupported D400 provider property request\n");
+		dev_err(dcp->dev, "unqualified D400 provider property request\n");
 		goto fail;
 	}
 
 	length = of_property_count_u8_elems(node, property->dt_name);
 	if (!property->length) {
-		/* Only this absent property has a known empty reply. */
+		/* Only this absent property has a measured empty reply. */
 		if (of_property_present(node, property->dt_name))
 			goto fail;
 	} else if (!of_property_present(node, property->dt_name) &&
 		   of_machine_is_compatible("apple,j700") &&
-		   (of_device_is_compatible(node, "apple,t8140-dcp") ||
-		    (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
-		     of_device_is_compatible(node, "apple,t8140-dcpext")))) {
-		/* Older loaders lack the newly described table properties. */
+		   of_device_is_compatible(node, "apple,t8140-dcp")) {
+		/* Qualified older loaders lack the newly described table properties. */
 		memset(reply, 0, sizeof(*reply));
 		memcpy(reply->data, property->legacy_data, property->length);
 		reply->length = cpu_to_le32(property->length);
-		dev_info_once(dcp->dev,
-			      "missing provider property %s (%u bytes); using the J700 defaults\n",
-			      property->dt_name, property->length);
+		dev_warn_once(dcp->dev, "using J700 provider data for an older loader\n");
 		return true;
 	} else if (length != (int)property->length) {
 		dev_err(dcp->dev, "invalid provider property %s: %d bytes\n",
@@ -487,7 +492,7 @@ static bool trampoline_luma_span_h17p(struct apple_dcp *dcp, int tag,
 
 	trace_iomfb_callback(dcp, tag, __func__);
 	if (get_unaligned_le32(in)) {
-		dev_err(dcp->dev, "unsupported D574 range selector\n");
+		dev_err(dcp->dev, "unqualified D574 range selector\n");
 		WRITE_ONCE(dcp->crashed, true);
 		return false;
 	}
@@ -511,7 +516,7 @@ static bool trampoline_get_uint_prop_h17p(struct apple_dcp *dcp, int tag,
 	    strnlen(request->key, sizeof(request->key)) == sizeof(request->key) ||
 	    strcmp(request->key, "Temperature") || request->value_null ||
 	    memchr_inv(request->padding, 0, sizeof(request->padding))) {
-		dev_err(dcp->dev, "unsupported D401 integer property query\n");
+		dev_err(dcp->dev, "unqualified D401 integer property query\n");
 		WRITE_ONCE(dcp->crashed, true);
 		return false;
 	}
@@ -699,104 +704,26 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[599] = trampoline_nop, /* find_swap_function_gated */
 };
 
+/*
+ * Validate a callback record and, the first time each runtime callback whose
+ * length is only bounded arrives with a different length, report the length
+ * actually seen.  Those reports are the first capture of these records.
+ */
 bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
 			       u32 out_len)
 {
-	return iomfb_validate_callback_h17p(tag, in_len, out_len);
-}
+	const struct dcp_callback_size *size;
 
-static_assert(sizeof(struct dcp_set_power_state_resp) == 8);
-
-struct dcp_external_power_cookie {
-	struct dcp_wait_cookie wait;
-	bool on;
-};
-
-/* A473 echoes the accepted state with zero status; DMA ownership is unchanged. */
-static void iomfb_external_power_complete(struct apple_dcp *dcp, void *out, void *data)
-{
-	struct dcp_external_power_cookie *cookie = data;
-	const struct dcp_packet_header *header;
-	int ret = -EPROTO;
-
-	if (out) {
-		header = out - sizeof(struct dcp_set_power_state_req_h17p) - sizeof(*header);
-		if (header->in_len == sizeof(struct dcp_set_power_state_req_h17p) &&
-		    header->out_len == sizeof(struct dcp_set_power_state_resp)) {
-			u64 reply = get_unaligned_le64(out);
-
-			ret = reply == (u64)cookie->on ? 0 : -EREMOTEIO;
-		}
-	}
-	WRITE_ONCE(cookie->wait.status, ret);
-	complete(&cookie->wait.done);
-	kref_put(&cookie->wait.refcount, release_wait_cookie);
-}
-
-static bool iomfb_external_reply_size(void *out, u32 in_len, u32 out_len)
-{
-	const struct dcp_packet_header *header;
-
-	if (!out)
+	if (!iomfb_validate_callback_h17p(tag, in_len, out_len))
 		return false;
-	header = out - in_len - sizeof(*header);
-	return header->in_len == in_len && header->out_len == out_len;
-}
-
-static void iomfb_external_parameter_complete(struct apple_dcp *dcp, void *out, void *data)
-{
-	struct dcp_set_power_state_req_h17p request = { .unklong = 1 };
-
-	if (!iomfb_external_reply_size(out, sizeof(struct dcp_set_parameter_dcp), sizeof(u32))) {
-		iomfb_external_power_complete(dcp, NULL, data);
-		return;
-	}
-	dcp_set_power_state(dcp, true, &request, iomfb_external_power_complete, data);
-}
-
-static void iomfb_external_device_complete(struct apple_dcp *dcp, void *out, void *data)
-{
-	struct dcp_set_parameter_dcp parameter = {
-		.param = IOMFBPARAM_ADAPTIVE_SYNC,
-		.count = 3,
-	};
-
-	if (!iomfb_external_reply_size(out, sizeof(u32), sizeof(u32))) {
-		iomfb_external_power_complete(dcp, NULL, data);
-		return;
-	}
-	/* Preserve the existing external power-on preparation and payload semantics. */
-	dcp_set_parameter_dcp(dcp, false, &parameter, iomfb_external_parameter_complete, data);
-}
-
-int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on)
-{
-	struct dcp_set_power_state_req_h17p request = { .unklong = on };
-	struct dcp_external_power_cookie *cookie;
-	int ret;
-
-	if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.stopped))
-		return -EIO;
-	cookie = kzalloc_obj(*cookie);
-	if (!cookie)
-		return -ENOMEM;
-	cookie->on = on;
-	cookie->wait.status = -ETIMEDOUT;
-	init_completion(&cookie->wait.done);
-	kref_init(&cookie->wait.refcount);
-	kref_get(&cookie->wait.refcount);
-	if (on) {
-		u32 handle = 2;
-
-		iomfb_opaque_x_reset_h17p(dcp);
-		dcp_set_display_device(dcp, false, &handle, iomfb_external_device_complete, cookie);
-	} else {
-		dcp_set_power_state(dcp, true, &request, iomfb_external_power_complete, cookie);
-	}
-	ret = wait_for_completion_timeout(&cookie->wait.done, msecs_to_jiffies(500));
-	ret = ret ? (int)READ_ONCE(cookie->wait.status) : -ETIMEDOUT;
-	kref_put(&cookie->wait.refcount, release_wait_cookie);
-	return ret;
+	size = &callback_sizes[tag];
+	if (size->minimum &&
+	    (in_len != size->in_len || out_len != size->out_len) &&
+	    !test_and_set_bit(tag, dcp->sized_callbacks))
+		dev_info(dcp->dev,
+			 "callback D%03d record is %#x/%#x bytes; its handler uses %#x/%#x\n",
+			 tag, in_len, out_len, size->in_len, size->out_len);
+	return true;
 }
 
 void iomfb_start_h17p(struct apple_dcp *dcp)
@@ -816,24 +743,6 @@ int iomfb_h17p_first_unbounded_callback(void)
 		if (cb_handlers[tag] && !callback_sizes[tag].valid)
 			return tag;
 	return -1;
-}
-
-/*
- * Hands a completion of @swap_id to the swap_complete_ap_gated callback, as
- * the firmware would.  The caller holds the IOMFB lock, as the receiver does.
- */
-int iomfb_h17p_deliver_swap_complete(struct apple_dcp *dcp, u32 swap_id)
-{
-	struct dc_swap_complete_resp_h17p *resp;
-
-	lockdep_assert_held(&dcp->iomfb.lock);
-	resp = kzalloc_obj(*resp);
-	if (!resp)
-		return -ENOMEM;
-	resp->swap_id = swap_id;
-	cb_handlers[590](dcp, 590, NULL, resp);
-	kfree(resp);
-	return 0;
 }
 #endif
 

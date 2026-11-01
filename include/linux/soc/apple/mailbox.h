@@ -38,10 +38,12 @@ enum apple_mbox_ascwrap_v6_role {
  * @wrapper_size: size of the provider's ASCWrap window
  * @iop_vbar_start: CPU physical base of the provider's IOP VBAR window
  * @iop_vbar_size: size of the provider's IOP VBAR window
- * @missing: remaining provider lifecycle work; zero for T8140
+ * @missing: remaining provider lifecycle work; zero for T8140 and T8142
  *
  * The apple-mailbox provider owns both mappings.  Consumers request CPU
  * transitions through the provider and never map either resource themselves.
+ * T8140 and T8142 have a matching start and stop transform. AppleA7IOP's
+ * resetState() only updates software state and performs no reset MMIO.
  */
 struct apple_mbox_ascwrap_v6_lifecycle {
 	enum apple_mbox_ascwrap_v6_role role;
@@ -78,17 +80,9 @@ struct apple_mbox {
 	void *cookie;
 
 	/*
-	 * Minimum utilization (uclamp_min) a consumer asked the threaded receive
-	 * handler to run with, and the value it last applied to itself; -1 is the
-	 * scheduler's default. See apple_mbox_set_rx_util_min().
-	 */
-	int rx_util_min;
-	int rx_util_min_applied;
-
-	/*
-	 * Protected by tx_lock: set while irq_send_empty is unmasked, so that
-	 * the IRQ handler and provider removal mask it exactly once between
-	 * them.
+	 * Protected by tx_lock. IRQ, send-error and provider-removal paths
+	 * mask an outstanding unmask only once; rebuild every consumer when
+	 * changing this internal structure's layout.
 	 */
 	bool tx_irq_unmasked;
 };
@@ -99,18 +93,6 @@ struct apple_mbox *apple_mbox_get_byname(struct device *dev, const char *name);
 int apple_mbox_start(struct apple_mbox *mbox);
 void apple_mbox_stop(struct apple_mbox *mbox);
 int apple_mbox_poll(struct apple_mbox *mbox);
-/*
- * Leave received messages in the hardware FIFO, without an interrupt, until
- * apple_mbox_release_rx().  For consumers that must not wake the system.
- */
-void apple_mbox_hold_rx(struct apple_mbox *mbox);
-void apple_mbox_release_rx(struct apple_mbox *mbox);
-/*
- * Set the minimum utilization (0..1024) the threaded receive handler runs with,
- * or -1 to restore the scheduler's default; the handler applies it to itself
- * when it next runs. Only mailboxes with a threaded receive handler support it.
- */
-int apple_mbox_set_rx_util_min(struct apple_mbox *mbox, int util_min);
 int apple_mbox_send(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 		    bool atomic);
 
