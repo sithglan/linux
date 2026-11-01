@@ -15,6 +15,7 @@
 #include <linux/workqueue.h>
 
 #include "isp-cam.h"
+#include "isp-debug.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
 #include "isp-regs.h"
@@ -23,6 +24,12 @@
 static void apple_isp_detach_genpd(struct apple_isp *isp)
 {
 	if (isp->pd_count <= 1)
+		return;
+	/* genpd detach queues power-off even with power_off=false. Keep the
+	 * virtual devices attached after a failed resident boot so ISP CPU
+	 * domains cannot be gated before the next system boot.
+	 */
+	if (isp->hw->resident_fw && isp->pds_on)
 		return;
 
 	for (int i = isp->pd_count - 1; i >= 0; i--) {
@@ -144,44 +151,17 @@ static int apple_isp_map_fw_mmio(struct apple_isp *isp)
 	return 0;
 }
 
-/* The IOVA range of a memory-region, from its last iommu-addresses entry. */
-static int isp_of_region_iova(struct device *dev, const char *name,
-			      phys_addr_t *base, size_t *size)
-{
-	const __be32 *maps, *end;
-	int idx, len;
-
-	idx = of_property_match_string(dev->of_node, "memory-region-names",
-				       name);
-	if (idx < 0)
-		return -ENOENT;
-
-	struct device_node *np __free(device_node) =
-		of_parse_phandle(dev->of_node, "memory-region", idx);
-	if (!np)
-		return -ENODEV;
-
-	maps = of_get_property(np, "iommu-addresses", &len);
-	if (!maps || !len)
-		return -ENODEV;
-
-	end = maps + len / sizeof(__be32);
-
-	while (maps < end) {
-		maps++;
-		maps = of_translate_dma_region(dev->of_node, maps, base, size);
-	}
-
-	return 0;
-}
-
 static int apple_isp_init_iommu(struct apple_isp *isp)
 {
 	struct device *dev = isp->dev;
-	phys_addr_t heap_base, data_base;
-	size_t heap_size, data_size;
+	phys_addr_t heap_base;
+	size_t heap_size;
 	u64 vm_size;
 	int err;
+	int idx;
+	int size;
+	struct device_node *mem_node;
+	const __be32 *maps, *end;
 
 	isp->domain = iommu_get_domain_for_dev(isp->dev);
 	if (!isp->domain)
@@ -189,37 +169,29 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	isp->shift = __ffs(isp->domain->pgsize_bitmap);
 	isp->fw_iova_mask = isp->hw->fw_iova_mask ?: U64_MAX;
 
-	err = isp_of_region_iova(dev, "heap", &heap_base, &heap_size);
-	if (err) {
+	idx = of_property_match_string(dev->of_node, "memory-region-names",
+				       "heap");
+	mem_node = of_parse_phandle(dev->of_node, "memory-region", idx);
+	if (!mem_node) {
+		dev_err(dev, "No memory-region found for heap\n");
+		return -ENODEV;
+	}
+
+	maps = of_get_property(mem_node, "iommu-addresses", &size);
+	if (!maps || !size) {
 		dev_err(dev, "No valid iommu-addresses found for heap\n");
 		return -ENODEV;
 	}
 
-	isp->fw.heap_base = heap_base;
-	isp->fw.heap_top = heap_base + heap_size;
+	end = maps + size / sizeof(__be32);
 
-	/*
-	 * Where the bootloader loads the firmware's data, it backs the
-	 * firmware's main memory only up to the end of it. The rest, up to
-	 * the heap top, is the host's to back.
-	 */
-	err = -ENOENT;
-	if (isp->hw->gen == ISP_GEN_T6040)
-		err = isp_of_region_iova(dev, "data", &data_base, &data_size);
-	if (!err) {
-		isp->fw.data_top = data_base + data_size;
-		if (isp->fw.data_top <= isp->fw.heap_base ||
-		    isp->fw.data_top > isp->fw.heap_top ||
-		    !IS_ALIGNED(isp->fw.data_top, 1UL << isp->shift)) {
-			dev_err(dev, "data 0x%llx outside the heap 0x%llx-0x%llx\n",
-				isp->fw.data_top, isp->fw.heap_base,
-				isp->fw.heap_top);
-			return -EINVAL;
-		}
-	} else if (err != -ENOENT) {
-		dev_err(dev, "No valid iommu-addresses found for data\n");
-		return -ENODEV;
+	while (maps < end) {
+		maps++;
+		maps = of_translate_dma_region(dev->of_node, maps, &heap_base,
+					       &heap_size);
 	}
+
+	isp->fw.heap_top = heap_base + heap_size;
 
 	err = of_property_read_u64(dev->of_node, "apple,dart-vm-size",
 				   &vm_size);
@@ -230,11 +202,11 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 
 	// FIXME: refactor this, maybe use regular iova stuff?
 	isp->iova_size = vm_size - (heap_base & 0xffffffff);
-	mt_init_flags(&isp->iovas, MT_FLAGS_ALLOC_RANGE);
+	drm_mm_init(&isp->iovad, isp->fw.heap_top, isp->iova_size);
 
 	err = apple_isp_map_fw_mmio(isp);
 	if (err) {
-		mtree_destroy(&isp->iovas);
+		drm_mm_takedown(&isp->iovad);
 		return err;
 	}
 
@@ -244,8 +216,7 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 static void apple_isp_free_iommu(struct apple_isp *isp)
 {
 	apple_isp_unmap_fw_mmio(isp, isp->hw->num_fw_mmio);
-	WARN_ON(!mtree_empty(&isp->iovas));
-	mtree_destroy(&isp->iovas);
+	drm_mm_takedown(&isp->iovad);
 }
 
 static int isp_of_read_coord(struct device *dev, struct device_node *np,
@@ -348,17 +319,9 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 						     const char *name)
 {
 	u32 ver[ISP_FW_VERSION_MAX_LEN];
-	int size, len;
-
-	/* The array reader truncates trailing bytes; require complete cells. */
-	if (of_find_property(dev->of_node, name, &size) && size % sizeof(u32)) {
-		dev_warn(dev, "could not parse %s: invalid length %d\n", name, size);
-		return ISP_FIRMWARE_V_UNKNOWN;
-	}
-
-	len = of_property_read_variable_u32_array(dev->of_node, name, ver,
-						  ISP_FW_VERSION_MIN_LEN,
-						  ISP_FW_VERSION_MAX_LEN);
+	int len = of_property_read_variable_u32_array(dev->of_node, name, ver,
+						      ISP_FW_VERSION_MIN_LEN,
+						      ISP_FW_VERSION_MAX_LEN);
 
 	switch (len) {
 	case -EINVAL:
@@ -398,10 +361,6 @@ isp_check_firmware_version(struct apple_isp *isp)
 	struct device *dev = isp->dev;
 	enum isp_firmware_version version, compat;
 
-	/* The H17 interface is selected by match data, not by version. */
-	if (isp->hw->fw_abi == ISP_FW_ABI_H17)
-		return ISP_FIRMWARE_V_UNKNOWN;
-
 	/* firmware version is just informative */
 	version = isp_read_fw_version(dev, "apple,firmware-version");
 	compat = isp_read_fw_version(dev, "apple,firmware-compat");
@@ -409,7 +368,9 @@ isp_check_firmware_version(struct apple_isp *isp)
 	dev_dbg(dev, "ISP firmware-compat: %s (FW: %s)\n", isp_fw2str(compat),
 		isp_fw2str(version));
 
-	if (!of_property_present(dev->of_node, "apple,firmware-compat"))
+	/* The H17 interface does not depend on it. */
+	if (isp->hw->fw_abi == ISP_FW_ABI_LEGACY &&
+	    !of_property_present(dev->of_node, "apple,firmware-compat"))
 		dev_warn(dev, "firmware compatibility version not provided, assuming 12.x\n");
 
 	return compat;
@@ -420,17 +381,14 @@ static int apple_isp_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct apple_isp *isp;
 	struct resource *res;
+	int hold;
 	int err;
 
 	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (err)
 		return err;
 
-	/*
-	 * Not devres: an open video device file keeps this until it is
-	 * closed, also after unbind. See apple_isp_release().
-	 */
-	isp = kzalloc_obj(*isp);
+	isp = devm_kzalloc(dev, sizeof(*isp), GFP_KERNEL);
 	if (!isp)
 		return -ENOMEM;
 
@@ -449,7 +407,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (err) {
 		dev_err(dev, "failed to get 'apple,platform-id' property: %d\n",
 			err);
-		goto free_isp;
+		return err;
 	}
 
 	err = of_property_read_u32(dev->of_node, "apple,temporal-filter",
@@ -457,21 +415,19 @@ static int apple_isp_probe(struct platform_device *pdev)
 	if (err)
 		isp->temporal_filter = 0;
 
-	/* the sensor connection layout, for firmware that takes it at boot */
-	of_property_read_u32(dev->of_node, "apple,cam-connections-scheme",
-			     &isp->cam_connections_scheme);
-
 	err = apple_isp_init_presets(isp);
 	if (err) {
 		dev_err(dev, "failed to initialize presets\n");
-		goto free_isp;
+		return err;
 	}
 
 	err = apple_isp_attach_genpd(isp);
 	if (err) {
 		dev_err(dev, "failed to attatch power domains\n");
-		goto free_isp;
+		return err;
 	}
+	apple_isp_debug_init(isp);
+	apple_isp_pm_trace(isp, "probe");
 
 	isp->coproc = devm_platform_ioremap_resource_byname(pdev, "coproc");
 	if (IS_ERR(isp->coproc)) {
@@ -530,15 +486,13 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto detach_genpd;
 	}
 
+	mutex_init(&isp->iovad_lock);
 	mutex_init(&isp->video_lock);
 	spin_lock_init(&isp->buf_lock);
 	init_waitqueue_head(&isp->wait);
 	INIT_LIST_HEAD(&isp->gc);
-	INIT_LIST_HEAD(&isp->gc_released);
-	mutex_init(&isp->gc_lock);
 	INIT_LIST_HEAD(&isp->bufs_pending);
 	INIT_LIST_HEAD(&isp->bufs_submitted);
-	INIT_LIST_HEAD(&isp->bufs_returned);
 	isp->wq = alloc_workqueue("apple-isp-wq", WQ_UNBOUND, 0);
 	if (!isp->wq) {
 		dev_err(dev, "failed to create workqueue\n");
@@ -572,10 +526,19 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto halt_firmware;
 	}
 
+	apple_isp_debug_register(isp);
+
 	return 0;
 
 halt_firmware:
+	hold = pm_runtime_resume_and_get(dev);
 	apple_isp_firmware_halt(isp);
+	apple_isp_free_firmware_surface(isp);
+	apple_isp_free_iommu(isp);
+	if (hold >= 0)
+		pm_runtime_put_sync(dev);
+	pm_runtime_disable(dev);
+	goto destroy_wq;
 free_surface:
 	pm_runtime_disable(dev);
 	apple_isp_free_firmware_surface(isp);
@@ -584,29 +547,52 @@ free_iommu:
 destroy_wq:
 	destroy_workqueue(isp->wq);
 detach_genpd:
+	apple_isp_debug_exit(isp);
 	apple_isp_detach_genpd(isp);
-free_isp:
-	kfree(isp->sensor_configs);
-	/* Nothing else can reach it before the video device is registered. */
-	kfree(isp);
 	return err;
 }
 
 static void apple_isp_remove(struct platform_device *pdev)
 {
 	struct apple_isp *isp = platform_get_drvdata(pdev);
+	bool hold;
 
+	/*
+	 * Keep the ISP, and with it its DARTs and ISP_SYS, powered until the
+	 * last mapping is gone. Otherwise stopping the firmware lets the
+	 * domain go off, and every unmap after that powers the DARTs up and
+	 * down again, resetting them each time, around a firmware that has
+	 * just been stopped.
+	 */
+	apple_isp_pm_step(isp, "remove: hold power");
+	hold = !isp->hw->resident_fw || isp->fw_state != ISP_FW_DEAD ||
+	       !isp->pds_on;
+	if (hold && pm_runtime_resume_and_get(isp->dev) < 0)
+		hold = false;
+	apple_isp_debug_unregister(isp);
+
+	apple_isp_pm_step(isp, "remove: unregister video");
 	apple_isp_remove_video(isp);
 	/* Stop resident firmware before freeing what it may still use. */
 	apple_isp_firmware_halt(isp);
+	apple_isp_pm_step(isp, "remove: unmap");
 	apple_isp_free_video(isp);
-	pm_runtime_disable(isp->dev);
 	apple_isp_free_firmware_surface(isp);
 	apple_isp_free_iommu(isp);
+
+	apple_isp_pm_step(isp, "remove: release power");
+	/* A dead resident boot retains the ISP and local-domain PM references.
+	 * Dropping either here can hang the SoC at an ISP CPU domain.
+	 */
+	if (hold)
+		pm_runtime_put_sync(isp->dev);
+	pm_runtime_disable(isp->dev);
 	destroy_workqueue(isp->wq);
+	apple_isp_pm_step(isp, "remove: detach power domains");
+	apple_isp_debug_exit(isp);
 	apple_isp_detach_genpd(isp);
-	/* Freed now, or when the last open file is closed. */
-	v4l2_device_put(&isp->v4l2_dev);
+	if (READ_ONCE(apple_isp_pm_debug))
+		dev_info(isp->dev, "pm: removed\n");
 }
 
 static const struct apple_isp_hw apple_isp_hw_t8103 = {
@@ -829,61 +815,59 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.resident_fw = true,
 };
 
-/* The same for T6040, from the J616s ADT's DART address filter. */
-static const struct isp_mmio_window apple_isp_fw_mmio_t6040[] = {
-	{ 0x220004000, 0x1d4000 },	/* DSID broadcast-clear windows */
-	{ 0x222004000, 0x1d4000 },
-	{ 0x224004000, 0x1d4000 },
-	{ 0x226004000, 0x1d4000 },
-	{ 0x485660000, 0x4000 },
-	{ 0x5003c0000, 0x28000 },	/* PMGR, with the PMP clock scratch */
-	{ 0x500e3c000, 0x4000 },
-	{ 0x502284000, 0x4000 },	/* PMGR, ISP power states */
-	{ 0x502880000, 0x8000 },
-	{ 0x504824000, 0x4000 },	/* PMP bandwidth scratch */
-	{ 0x51062c000, 0x20000 },
+/*
+ * T8142 (M5, J813): the Neo's ISP17a. The J813 ADT's dart-isp
+ * dapf-instance-0 ranges, rounded out to 16 KiB pages; mostly the T8140
+ * windows at +0x80000000, with one DSID window and two new ranges.
+ */
+static const struct isp_mmio_window apple_isp_fw_mmio_t8142[] = {
+	{ 0x220104000, 0x14000 },	/* DSID broadcast-clear window */
+	{ 0x3803c0000, 0x28000 },	/* PMGR, with the PMP clock scratch */
+	{ 0x380704000, 0x4000 },	/* PMGR, ISP power states */
+	{ 0x380730000, 0x4000 },
+	{ 0x380e3c000, 0x4000 },
+	{ 0x382724000, 0x4000 },	/* PMP bandwidth scratch */
+	{ 0x39062c000, 0x30000 },
+	{ 0x3a1340000, 0x4000 },
+	{ 0x3a1358000, 0xc000 },
+	{ 0x421660000, 0x4000 },
 };
 
-/*
- * T6040 runs the same coprocessor and firmware interface as T8140, booted
- * as macOS boots it on the J616s (macOS 26.6.2 camera log, kext register
- * map) and as aurora's m1n1 proxy captures with it: no coprocessor reset,
- * four broadcast-clear windows in eight slots, the scaler 1 output path and
- * no capture metadata pool or watchdog.
- */
-static const struct apple_isp_hw apple_isp_hw_t6040 = {
-	.gen = ISP_GEN_T6040,
+static const struct apple_isp_hw apple_isp_hw_t8142 = {
+	.gen = ISP_GEN_T8140,
 	.fw_abi = ISP_FW_ABI_H17,
 	.pmu_base = 0x0,
 
-	.dsid_count = 4,
-	.dsid_slots = 8,
-	.dsid_clr_base0 = 0x2201d4000,
-	.dsid_clr_base1 = 0x2221d4000,
-	.dsid_clr_base2 = 0x2241d4000,
-	.dsid_clr_base3 = 0x2261d4000,
+	.dsid_count = 1,
+	.dsid_clr_base0 = 0x220116000,
 	.dsid_clr_range0 = 0x2fc,
 
-	/* the PMGR and PMP scratch words of the ISP's DAPF windows */
-	.clock_scratch = 0x5003d0fa8,
+	.clock_scratch = 0x3803d0ca0,
 	.clock_base = 0x0,
 	.clock_bit = 0x0,
 	.clock_size = 0x8,
-	.bandwidth_scratch = 0x504824000,
+	.bandwidth_scratch = 0x382724000,
 	.bandwidth_base = 0x0,
 	.bandwidth_bit = 0x0,
 	.bandwidth_size = 0x8,
 	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
 
+	/*
+	 * No BES scaler: the firmware asserts on CH_CROP_SET ("BesProc is
+	 * removed/not present. Must config AuxSclPr") and takes the SCL1 set.
+	 */
 	.scl1 = true,
-	.lpdp = false,
+	.lpdp = true,
 	.meta_size = ISP_META_SIZE_T8140,
-	.fw_mmio = apple_isp_fw_mmio_t6040,
-	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6040),
 
+	.fw_iova_mask = GENMASK_ULL(35, 0),
+	.mbox2_offset = 0x410,
+	.mbox_irq_route = true,
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.fw_mmio = apple_isp_fw_mmio_t8142,
+	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8142),
 	.boot_mode = 1,
-	.shared_size = 0xde600000,
+	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.resident_fw = true,
 };
 
@@ -896,7 +880,7 @@ static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t6030-isp", .data = &apple_isp_hw_t6030 },
 	{ .compatible = "apple,t6031-isp", .data = &apple_isp_hw_t6031 },
 	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
-	{ .compatible = "apple,t6041-isp", .data = &apple_isp_hw_t6040 },
+	{ .compatible = "apple,t8142-isp", .data = &apple_isp_hw_t8142 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, apple_isp_of_match);

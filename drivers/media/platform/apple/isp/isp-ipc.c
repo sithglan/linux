@@ -6,16 +6,10 @@
 #include "isp-regs.h"
 #include "isp-fw.h"
 
-#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
-#include <kunit/static_stub.h>
-#endif
-
 #define ISP_IPC_FLAG_TERMINAL_ACK	0x3
 /* longer firmware log lines are cut */
 #define ISP_IPC_TERMINAL_MAX_LEN	512
 #define ISP_IPC_BUFEXC_STAT_META_OFFSET 0x10
-/* how much longer a timed-out request may take to be answered */
-#define ISP_IPC_RESYNC_TIMEOUT		msecs_to_jiffies(1000)
 
 struct isp_sm_deferred_work {
 	struct work_struct work;
@@ -72,17 +66,7 @@ static inline void chan_read_msg_index(struct apple_isp *isp,
 				       struct isp_channel *chan,
 				       struct isp_message *msg, u32 index)
 {
-	if (isp_is_p010(isp)) {
-		u64 *slot = chan_msg_virt(chan, index);
-		u64 arg0 = READ_ONCE(*slot);
-
-		/* Acquire validity before consuming the firmware-owned payload. */
-		dma_rmb();
-		memcpy(msg, slot, sizeof(*msg));
-		msg->arg0 = arg0;
-	} else {
-		memcpy(msg, chan_msg_virt(chan, index), sizeof(*msg));
-	}
+	memcpy(msg, chan_msg_virt(chan, index), sizeof(*msg));
 }
 
 static inline void chan_read_msg(struct apple_isp *isp,
@@ -140,8 +124,6 @@ static int chan_handle_once(struct apple_isp *isp, struct isp_channel *chan)
 	isp_mbox2_write32(isp, ISP_MBOX2_IRQ_DOORBELL, chan->doorbell);
 
 	chan_update_cursor(chan);
-	if (chan->ops->complete)
-		chan->ops->complete(isp);
 
 	return 0;
 }
@@ -157,12 +139,10 @@ static inline bool chan_rx_done(struct apple_isp *isp, struct isp_channel *chan)
 
 int ipc_chan_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
-	unsigned int budget = isp_is_p010(isp) ? chan->num : UINT_MAX;
 	int err = 0;
 
 	mutex_lock(&chan->lock);
-	/* A busy producer must not starve the other completion/control rings. */
-	while (budget--) {
+	while (1) {
 		chan_read_msg(isp, chan, &chan->req);
 		if (chan_rx_done(isp, chan)) {
 			err = 0;
@@ -180,9 +160,6 @@ int ipc_chan_handle(struct apple_isp *isp, struct isp_channel *chan)
 
 static inline bool chan_tx_done(struct apple_isp *isp, struct isp_channel *chan)
 {
-	if (isp_is_p010(isp) && chan->deadline_active &&
-	    time_after_eq(jiffies, chan->deadline))
-		return false;
 	dma_rmb();
 
 	chan_read_msg(isp, chan, &chan->rsp);
@@ -194,66 +171,11 @@ static inline bool chan_tx_done(struct apple_isp *isp, struct isp_channel *chan)
 	return false;
 }
 
-/*
- * A request that timed out still owns its slot, and the firmware may answer
- * it late. That answer must not be taken for the answer to the next request,
- * which goes in the same slot with the same arg0, and the next request must
- * not overwrite the command area while the firmware may still read the old
- * one. So before anything else is written, wait once more for the late
- * answer, for a bounded time, and consume it; the ring is then in step again.
- * If it has not come yet, the doorbell is rung again in case the first one
- * was missed. IO and DEBUG share a doorbell bit, so the firmware already
- * copes with a doorbell that brings no new request. If the firmware still
- * does not answer, where it is in the ring is unknown and nothing more is
- * sent until it is stopped.
- */
-int isp_ipc_resync(struct apple_isp *isp)
-{
-	struct isp_channel *chan = isp->ipc_stale;
-
-	if (isp->ipc_failed)
-		return -EIO;
-	if (!chan)
-		return 0;
-
-	isp->ipc_stale = NULL;
-	chan->deadline_active = false;
-	if (!chan_tx_done(isp, chan)) {
-		isp_mbox2_write32(isp, ISP_MBOX2_IRQ_DOORBELL, chan->doorbell);
-		if (!wait_event_timeout(isp->wait, chan_tx_done(isp, chan),
-					ISP_IPC_RESYNC_TIMEOUT)) {
-			isp->ipc_failed = true;
-			dev_err(isp->dev,
-				"%s: no answer to the timed-out request, sending no more commands\n",
-				chan->name);
-			return -EIO;
-		}
-	}
-
-	dev_warn(isp->dev,
-		 "%s: timed-out request answered late, channel back in step\n",
-		 chan->name);
-
-	return 0;
-}
-
 int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 		  unsigned long timeout)
 {
 	long t;
-	int err;
 
-#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
-	KUNIT_STATIC_STUB_REDIRECT(ipc_chan_send, isp, chan, timeout);
-#endif
-	/* Callers that fill the command area resync before doing so. */
-	err = isp_ipc_resync(isp);
-	if (err)
-		return err;
-	if (isp_is_p010(isp) && timeout) {
-		chan->deadline = jiffies + timeout;
-		chan->deadline_active = true;
-	}
 	chan_write_msg(isp, chan, &chan->req);
 	dma_wmb();
 
@@ -264,9 +186,6 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 
 	t = wait_event_timeout(isp->wait, chan_tx_done(isp, chan), timeout);
 	if (t == 0) {
-		/* Resolved before the next request, see isp_ipc_resync(). */
-		if (isp_is_p010(isp))
-			isp->ipc_stale = chan;
 		dev_err(isp->dev,
 			"%s: timed out on request [0x%llx, 0x%llx, 0x%llx]\n",
 			chan->name, chan->req.arg0, chan->req.arg1,
@@ -274,11 +193,14 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 		return -ETIME;
 	}
 
-	chan->deadline_active = false;
 	isp_dbg(isp, "%s: request success (%ld)\n", chan->name, t);
 
 	return 0;
 }
+
+static bool fw_log;
+module_param(fw_log, bool, 0644);
+MODULE_PARM_DESC(fw_log, "Print the firmware log at info level (diagnostic)");
 
 int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
@@ -291,7 +213,9 @@ int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 	/* Firmware log output, available through dynamic debug */
 	if (iova && size && isp->log_surf) {
 		line = apple_isp_translate(isp, isp->log_surf, iova, size);
-		if (line)
+		if (line && fw_log)
+			dev_info(isp->dev, "ISPASC: %.*s", (int)size, line);
+		else if (line)
 			dev_dbg(isp->dev, "ISPASC: %.*s", (int)size, line);
 	}
 
@@ -300,44 +224,6 @@ int ipc_tm_handle(struct apple_isp *isp, struct isp_channel *chan)
 	rsp->arg2 = 0x0;
 
 	return 0;
-}
-
-/*
- * The firmware frees a SHAREDMALLOC surface by sending its iova. It does not
- * free every surface it allocated, and may still access a surface after
- * freeing it, so the surface is only moved to the released list here; it is
- * freed once the stream has stopped, see isp_free_released_surfaces(), and
- * what the firmware never frees is freed when the firmware stops.
- */
-static void ipc_sm_release(struct apple_isp *isp, dma_addr_t iova)
-{
-	struct isp_surf *surf, *found = NULL;
-
-	mutex_lock(&isp->gc_lock);
-	list_for_each_entry(surf, &isp->gc, head) {
-		if (surf->iova == iova) {
-			found = surf;
-			list_move_tail(&surf->head, &isp->gc_released);
-			break;
-		}
-	}
-	mutex_unlock(&isp->gc_lock);
-
-	if (!found) {
-		dev_warn_ratelimited(isp->dev,
-				     "firmware freed unknown shared surface %pad\n",
-				     &iova);
-		return;
-	}
-
-	/* The terminal and buffer return handlers run in this thread. */
-	if (found == isp->log_surf)
-		isp->log_surf = NULL;
-	if (found == isp->bt_surf)
-		isp->bt_surf = NULL;
-
-	isp_dbg(isp, "shared surface released: iova %pad size 0x%llx\n",
-		&found->iova, found->size);
 }
 
 int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan)
@@ -381,8 +267,11 @@ int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan)
 				surf->iova, surf->size);
 		}
 	} else {
-		ipc_sm_release(isp, isp_fw_iova(isp, req->arg0));
-
+		/* This should be the shared surface free request, but
+		 * 1) The fw doesn't request to free all of what it requested
+		 * 2) The fw continues to access the surface after
+		 * So we link it to the gc, which runs after fw shutdown
+		 */
 		rsp->arg0 = req->arg0 | ISP_IPC_FLAG_ACK;
 		rsp->arg1 = 0x0;
 		rsp->arg2 = 0x0;
@@ -390,7 +279,3 @@ int ipc_sm_handle(struct apple_isp *isp, struct isp_channel *chan)
 
 	return 0;
 }
-
-#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
-#include "isp-ipc-test.c"
-#endif

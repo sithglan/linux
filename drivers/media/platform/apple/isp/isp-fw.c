@@ -2,7 +2,6 @@
 /* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
 
 #include "isp-fw.h"
-#include "isp-ipc-layout.h"
 
 #include <asm/io.h>
 #include <linux/delay.h>
@@ -10,10 +9,10 @@
 #include <linux/overflow.h>
 #include <linux/pm_runtime.h>
 #include <linux/types.h>
-#include <linux/unaligned.h>
 
 #include "isp-cam.h"
 #include "isp-cmd.h"
+#include "isp-debug.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
 #include "isp-ipc.h"
@@ -63,44 +62,49 @@ static int isp_gpio_wait(struct apple_isp *isp, u32 reg, u32 expected)
 				  ISP_FIRMWARE_TIMEOUT_US);
 }
 
+/* Power up the local domains that are not on yet, in order. */
 static int apple_isp_power_up_domains(struct apple_isp *isp)
 {
+	int was_on = isp->pds_on;
 	int ret;
 
-	if (isp->pds_active)
-		return 0;
-
-	for (int i = 1; i < isp->pd_count; i++) {
+	for (int i = isp->pds_on + 1; i < isp->pd_count; i++) {
+		apple_isp_pm_step(isp, "power up domain %d", i);
 		ret = pm_runtime_resume_and_get(isp->pd_dev[i]);
 		if (ret < 0) {
 			dev_err(isp->dev,
 				"Failed to power up power domain %d: %d\n", i, ret);
-			while (--i >= 1)
-				pm_runtime_put_sync(isp->pd_dev[i]);
+			apple_isp_pm_trace(isp, "domain %d did not come up", i);
+			if (!isp->hw->resident_fw)
+				while (isp->pds_on > was_on)
+					pm_runtime_put_sync(isp->pd_dev[isp->pds_on--]);
 			return ret;
 		}
+		isp->pds_on = i;
 	}
 
-	isp->pds_active = true;
+	isp->pds_on = max(isp->pd_count - 1, 0);
+	apple_isp_pm_trace(isp, "local domains up");
 
 	return 0;
 }
 
+/* Power the local domains down in reverse order, except pds_keep of them. */
 static void apple_isp_power_down_domains(struct apple_isp *isp)
 {
+	int keep = clamp(isp->pds_keep, 0, isp->pds_on);
 	int ret;
 
-	if (!isp->pds_active)
-		return;
-
-	for (int i = isp->pd_count - 1; i >= 1; i--) {
+	for (int i = isp->pds_on; i > keep; i--) {
+		apple_isp_pm_step(isp, "power down domain %d", i);
 		ret = pm_runtime_put_sync(isp->pd_dev[i]);
 		if (ret < 0)
 			dev_err(isp->dev,
 				"Failed to power down power domain %d: %d\n", i, ret);
 	}
 
-	isp->pds_active = false;
+	isp->pds_on = keep;
+	apple_isp_pm_trace(isp, "local domains down");
 }
 
 void *apple_isp_translate(struct apple_isp *isp, struct isp_surf *surf,
@@ -164,7 +168,6 @@ static_assert(sizeof(struct isp_firmware_bootargs) == 0x180);
  */
 #define ISP_H16_DESCRIPTOR_SIZE		0x200
 #define ISP_H16_SHARED_SIZE		0xee000000ULL
-#define ISP_H16_DESC_CAM_SCHEME		0x60
 #define ISP_H16_DESC_NO_OPTICAL_CARD_ID 0xb0
 
 struct isp_firmware_bootargs_h16 {
@@ -212,7 +215,6 @@ static const struct isp_chan_ops sm_ops = {
 
 static const struct isp_chan_ops bt_ops = {
 	.handle = ipc_bt_handle,
-	.complete = ipc_bt_complete,
 };
 
 static irqreturn_t apple_isp_isr(int irq, void *dev)
@@ -318,31 +320,6 @@ static int isp_reset_coproc_t8140(struct apple_isp *isp)
 	return 0;
 }
 
-/*
- * The T6040 firmware is started as the bootloader left it, without a reset:
- * the coprocessor must never have run, and its reset vector must be the
- * entry of the firmware text at the base of the heap region.
- */
-static int isp_check_coproc_t6040(struct apple_isp *isp)
-{
-	u32 control = isp_coproc_read32(isp, isp_coproc_control(isp));
-	u64 rvbar = readq(isp->coproc + ISP_COPROC_RVBAR);
-
-	if (control) {
-		isp_err(isp, "coprocessor already started (control 0x%x)\n",
-			control);
-		return -EBUSY;
-	}
-
-	if (rvbar != (isp->fw.heap_base | 1)) {
-		isp_err(isp, "reset vector 0x%llx is not the firmware at 0x%llx\n",
-			rvbar, isp->fw.heap_base);
-		return -ENODEV;
-	}
-
-	return 0;
-}
-
 static int isp_reset_coproc(struct apple_isp *isp)
 {
 	int retries;
@@ -351,8 +328,6 @@ static int isp_reset_coproc(struct apple_isp *isp)
 
 	if (isp->hw->gen == ISP_GEN_T8140)
 		return isp_reset_coproc_t8140(isp);
-	if (isp->hw->gen == ISP_GEN_T6040)
-		return isp_check_coproc_t6040(isp);
 
 	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
 
@@ -393,9 +368,12 @@ static int isp_reset_coproc(struct apple_isp *isp)
 
 static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 {
+	apple_isp_pm_step(isp, "stop coprocessor");
 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 
-	apple_isp_power_down_domains(isp);
+	/* A failed resident boot may leave the ISP CPU in an unknown state. */
+	if (isp->fw_state != ISP_FW_DEAD)
+		apple_isp_power_down_domains(isp);
 }
 
 static int isp_firmware_boot_stage1(struct apple_isp *isp)
@@ -407,8 +385,8 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	if (err < 0)
 		return err;
 
-	/* ISP17a and T6040 have no clock enable word */
-	if (isp->hw->gen != ISP_GEN_T8140 && isp->hw->gen != ISP_GEN_T6040)
+	/* ISP17a has no clock enable word */
+	if (isp->hw->gen != ISP_GEN_T8140)
 		isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
 
 #if 0
@@ -421,9 +399,11 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	}
 #endif
 
+	apple_isp_pm_step(isp, "reset coprocessor");
 	err = isp_reset_coproc(isp);
 	if (err < 0)
 		goto shutdown;
+	apple_isp_pm_trace(isp, "coprocessor reset");
 
 	isp_gpio_write32(isp, ISP_GPIO_0, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_1, 0x0);
@@ -436,6 +416,7 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 
 	isp_mbox_write32(isp, isp->hw->mbox_irq_enable, 0x0);
 
+	apple_isp_pm_step(isp, "start coprocessor");
 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x10);
 
@@ -443,14 +424,18 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {
 		isp_err(isp,
 			"never received first magic number from firmware\n");
+		apple_isp_pm_trace(isp, "no first magic");
 		err = -ENODEV;
 		goto shutdown;
 	}
 	isp_dbg(isp, "got first magic number from firmware\n");
+	apple_isp_pm_trace(isp, "first magic");
 
 	return 0;
 
 shutdown:
+	if (isp->hw->resident_fw)
+		isp->fw_state = ISP_FW_DEAD;
 	isp_firmware_shutdown_stage1(isp);
 	return err;
 }
@@ -475,38 +460,18 @@ int apple_isp_alloc_firmware_surface(struct apple_isp *isp)
 	dev_dbg(isp->dev, "Data surface iova: 0x%llx\n",
 		(long long)isp->data_surf->iova);
 
-	/* Without it, the firmware faults on its first writes there. */
-	if (isp->fw.data_top && isp->fw.data_top < isp->fw.heap_top) {
-		isp->main_tail_surf =
-			isp_alloc_surface_at(isp, isp->fw.data_top,
-					     isp->fw.heap_top - isp->fw.data_top);
-		if (!isp->main_tail_surf) {
-			isp_err(isp, "failed to back main memory 0x%llx-0x%llx\n",
-				isp->fw.data_top, isp->fw.heap_top);
-			isp_free_surface(isp, isp->data_surf);
-			isp_free_surface(isp, isp->ipc_surf);
-			return -ENOMEM;
-		}
-	}
-
 	return 0;
 }
 
 void apple_isp_free_firmware_surface(struct apple_isp *isp)
 {
-	if (isp->main_tail_surf)
-		isp_free_surface(isp, isp->main_tail_surf);
 	isp_free_surface(isp, isp->data_surf);
 	isp_free_surface(isp, isp->ipc_surf);
 }
 
 static void isp_firmware_shutdown_stage2(struct apple_isp *isp)
 {
-	if (!isp->extra_surf)
-		return;
-
 	isp_free_surface(isp, isp->extra_surf);
-	isp->extra_surf = NULL;
 }
 
 static void isp_write_bootargs(struct apple_isp *isp, void *virt,
@@ -537,26 +502,25 @@ static void isp_write_bootargs_h16(struct apple_isp *isp, void *virt,
 	memset(&args, 0, sizeof(args));
 	args.ipc_iova = isp->ipc_surf->iova;
 	args.shared_base = isp->fw.heap_top & 0xffffffff;
-	args.shared_size = isp->hw->shared_size ?: ISP_H16_SHARED_SIZE;
+	args.shared_size = ISP_H16_SHARED_SIZE;
 	args.extra_iova = isp->extra_surf->iova;
 	args.extra_size = isp->extra_surf->size;
 	args.platform_id = isp->platform_id;
 	args.ipc_queue_size = (u64)args_offset + 1;
 	args.unk_68 = 0x40;
-	put_unaligned_le64(isp->cam_connections_scheme,
-			   &args.descriptor[ISP_H16_DESC_CAM_SCHEME]);
 	args.descriptor[ISP_H16_DESC_NO_OPTICAL_CARD_ID] = 1;
 	memcpy(virt, &args, sizeof(args));
 }
 
 static int isp_firmware_boot_stage2(struct apple_isp *isp)
 {
-	bool h17 = isp->hw->fw_abi == ISP_FW_ABI_H17;
-	size_t args_size = h17 ? sizeof(struct isp_firmware_bootargs_h16) :
+	bool h16 = isp->hw->fw_abi == ISP_FW_ABI_H17;
+	size_t args_size = h16 ? sizeof(struct isp_firmware_bootargs_h16) :
 				 sizeof(struct isp_firmware_bootargs);
 	size_t cmd_size = ISP_CMD_AREA_SIZE(isp_num_capmeta(isp));
 	dma_addr_t args_iova, cmd_iova;
 	void *args_virt, *cmd_virt;
+	int err;
 
 	u32 num_ipc_chans = isp_gpio_read32(isp, ISP_GPIO_0);
 	u32 args_offset = isp_gpio_read32(isp, ISP_GPIO_1);
@@ -575,7 +539,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 			 num_ipc_chans);
 
 	/* Only hand the H16 descriptor to firmware that asks for it. */
-	if (h17 && !(desc_flags & ISP_GPIO2_H16_DESCRIPTOR)) {
+	if (h16 && !(desc_flags & ISP_GPIO2_H16_DESCRIPTOR)) {
 		dev_err(isp->dev,
 			"firmware did not request the H16 boot descriptor (0x%x)\n",
 			desc_flags);
@@ -609,11 +573,9 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	}
 
 	isp->cmd_iova = cmd_iova;
-	isp->ipc_boot_iova = args_iova;
-	isp->ipc_boot_size = args_size + 0x40 + cmd_size;
 	isp->cmd_virt = cmd_virt;
 
-	if (h17)
+	if (h16)
 		isp_write_bootargs_h16(isp, args_virt, args_offset);
 	else
 		isp_write_bootargs(isp, args_virt, args_iova);
@@ -629,18 +591,20 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	/* Wait for ISP_GPIO_7 to 0xf7fbdff9 -> 0x8042006 */
 	isp_gpio_write32(isp, ISP_GPIO_7, 0xf7fbdff9);
 
-	/*
-	 * The firmware may already use the extra heap: it is freed only once
-	 * the coprocessor has stopped, see isp_firmware_boot().
-	 */
 	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {
 		isp_err(isp,
 			"never received second magic number from firmware\n");
-		return -ENODEV;
+		apple_isp_pm_trace(isp, "no second magic");
+		err = -ENODEV;
+		goto free_extra;
 	}
 	isp_dbg(isp, "got second magic number from firmware\n");
 
 	return 0;
+
+free_extra:
+	isp_free_surface(isp, isp->extra_surf);
+	return err;
 }
 
 static inline struct isp_channel *isp_get_chan_index(struct apple_isp *isp,
@@ -672,11 +636,6 @@ static void isp_free_channel_info(struct apple_isp *isp)
 
 static int isp_fill_channel_info(struct apple_isp *isp)
 {
-	struct isp_ipc_extent reserved[ISP_IPC_MAX_CHANNELS + 2];
-	struct isp_ipc_extent ipc = {
-		.iova = isp->ipc_surf->iova,
-		.size = isp->ipc_surf->size,
-	};
 	u64 table_iova = isp_gpio_read32(isp, ISP_GPIO_0) |
 			 ((u64)isp_gpio_read32(isp, ISP_GPIO_1)) << 32;
 	void *table_virt = apple_isp_ipc_translate(
@@ -686,18 +645,6 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 
 	if (!table_virt) {
 		dev_err(isp->dev, "Failed to find channel table\n");
-		return -EIO;
-	}
-	reserved[0].iova = isp_fw_iova(isp, table_iova);
-	reserved[0].size = array_size(sizeof(struct isp_chan_desc),
-				      isp->num_ipc_chans);
-	/* Use the argument/command span already validated by stage 2. */
-	reserved[1].iova = isp->ipc_boot_iova;
-	reserved[1].size = isp->ipc_boot_size;
-	if (!isp_ipc_extent_contains(ipc, reserved[0]) ||
-	    !isp_ipc_extent_contains(ipc, reserved[1]) ||
-	    isp_ipc_extents_overlap(reserved[0], reserved[1])) {
-		isp_err(isp, "invalid ipc channel table or boot storage\n");
 		return -EIO;
 	}
 
@@ -747,13 +694,6 @@ static int isp_fill_channel_info(struct apple_isp *isp)
 			goto out;
 		}
 		chan->doorbell = BIT(chan->src);
-		reserved[i + 2].iova = chan->iova;
-		reserved[i + 2].size = chan->size;
-		if (!isp_ipc_ring_valid(ipc, reserved[i + 2], reserved, i + 2)) {
-			isp_err(isp, "invalid ipc chan %s layout\n",
-				chan->name);
-			goto out;
-		}
 
 		chan->virt =
 			apple_isp_ipc_translate(isp, chan->iova, chan->size);
@@ -826,11 +766,13 @@ static int isp_firmware_boot_stage3(struct apple_isp *isp)
 	if (isp_gpio_wait(isp, ISP_GPIO_3, 0x0)) {
 		isp_err(isp,
 			"never received third magic number from firmware\n");
+		apple_isp_pm_trace(isp, "no third magic");
 		isp_free_channel_info(isp);
 		return -ENODEV;
 	}
 
 	isp_dbg(isp, "firmware booted!\n");
+	apple_isp_pm_trace(isp, "firmware booted");
 
 	return 0;
 }
@@ -873,26 +815,12 @@ static int isp_set_dsid_clr(struct apple_isp *isp)
 	int err;
 
 	/*
-	 * The H17 firmware takes no PMU base, and its broadcast-clear windows
-	 * in the multi-window form.
+	 * The H17 firmware takes no PMU base, and its single broadcast-clear
+	 * window in the multi-window form.
 	 */
-	if (hw->fw_abi == ISP_FW_ABI_H17) {
-		const u64 used[] = { hw->dsid_clr_base0, hw->dsid_clr_base1,
-				     hw->dsid_clr_base2, hw->dsid_clr_base3 };
-		u64 bases[ISP_DSID_MULTI_BC_MAX];
-		unsigned int slots = max_t(unsigned int, hw->dsid_count,
-					   hw->dsid_slots);
-
-		if (WARN_ON(hw->dsid_count > ARRAY_SIZE(used) ||
-			    slots > ARRAY_SIZE(bases)))
-			return -EINVAL;
-
-		for (unsigned int i = 0; i < slots; i++)
-			bases[i] = i < hw->dsid_count ? used[i] : U64_MAX;
-
-		return isp_cmd_set_dsid_clr_multi_bc(isp, bases, slots,
+	if (hw->fw_abi == ISP_FW_ABI_H17)
+		return isp_cmd_set_dsid_clr_multi_bc(isp, hw->dsid_clr_base0,
 						     hw->dsid_clr_range0);
-	}
 
 	err = isp_cmd_set_isp_pmu_base(isp, hw->pmu_base);
 	if (err)
@@ -950,27 +878,11 @@ static void isp_collect_gc_surface(struct apple_isp *isp)
 	isp->log_surf = NULL;
 	isp->bt_surf = NULL;
 
-	isp_free_released_surfaces(isp);
-
 	list_for_each_entry_safe_reverse(surf, tmp, &isp->gc, head) {
 		isp_dbg(isp, "freeing iova: %pad size: 0x%llx virt: %pS\n",
 			&surf->iova, surf->size, (void *)surf->virt);
 		isp_free_surface(isp, surf);
 	}
-}
-
-/*
- * Stop the coprocessor and power its domains down, then release the memory
- * the firmware may still be using: its channel table, extra heap and the
- * surfaces it requested.
- */
-static void isp_firmware_stop(struct apple_isp *isp)
-{
-	isp_firmware_shutdown_stage1(isp);
-
-	isp_firmware_shutdown_stage3(isp);
-	isp_firmware_shutdown_stage2(isp);
-	isp_collect_gc_surface(isp);
 }
 
 static int isp_firmware_boot(struct apple_isp *isp)
@@ -979,29 +891,26 @@ static int isp_firmware_boot(struct apple_isp *isp)
 
 	err = isp_firmware_boot_stage1(isp);
 	if (err < 0) {
-		/* Stage 1 stops the coprocessor and powers it down itself. */
 		isp_err(isp, "failed firmware boot stage 1: %d\n", err);
-		isp_collect_gc_surface(isp);
-		return err;
+		goto garbage_collect;
 	}
 
-	/* From here on the firmware runs, and may use what it was given. */
 	err = isp_firmware_boot_stage2(isp);
 	if (err < 0) {
 		isp_err(isp, "failed firmware boot stage 2: %d\n", err);
-		goto stop;
+		goto shutdown_stage1;
 	}
 
 	err = isp_firmware_boot_stage3(isp);
 	if (err < 0) {
 		isp_err(isp, "failed firmware boot stage 3: %d\n", err);
-		goto stop;
+		goto shutdown_stage2;
 	}
 
 	err = isp_enable_irq(isp);
 	if (err < 0) {
 		isp_err(isp, "failed to enable interrupts: %d\n", err);
-		goto stop;
+		goto shutdown_stage3;
 	}
 
 	err = isp_start_command_processor(isp);
@@ -1016,8 +925,16 @@ static int isp_firmware_boot(struct apple_isp *isp)
 
 disable_irqs:
 	isp_disable_irq(isp);
-stop:
-	isp_firmware_stop(isp);
+shutdown_stage3:
+	isp_firmware_shutdown_stage3(isp);
+shutdown_stage2:
+	isp_firmware_shutdown_stage2(isp);
+shutdown_stage1:
+	if (isp->hw->resident_fw)
+		isp->fw_state = ISP_FW_DEAD;
+	isp_firmware_shutdown_stage1(isp);
+garbage_collect:
+	isp_collect_gc_surface(isp);
 	return err;
 }
 
@@ -1029,10 +946,21 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 	 * Stop the coprocessor before releasing any memory the firmware
 	 * uses, also when it did not acknowledge the suspend request.
 	 */
-	if (isp_stop_command_processor(isp))
-		dev_warn(isp->dev, "firmware did not suspend, stopping it\n");
+	apple_isp_pm_step(isp, "suspend firmware");
+	if (isp_stop_command_processor(isp)) {
+		dev_warn(isp->dev, "firmware did not suspend, retaining its power domains\n");
+		if (isp->hw->resident_fw)
+			isp->fw_state = ISP_FW_DEAD;
+	}
+	apple_isp_pm_trace(isp, "firmware suspended");
 	isp_disable_irq(isp);
-	isp_firmware_stop(isp);
+	isp_firmware_shutdown_stage1(isp);
+
+	apple_isp_pm_step(isp, "free firmware memory");
+	isp_firmware_shutdown_stage3(isp);
+	isp_firmware_shutdown_stage2(isp);
+	isp_collect_gc_surface(isp);
+	apple_isp_pm_trace(isp, "firmware memory freed");
 }
 
 /*
@@ -1056,31 +984,36 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 		return 0;
 	case ISP_FW_DEAD:
 		dev_err_ratelimited(isp->dev,
-				    "firmware was stopped and cannot be restarted before the next boot\n");
+				    "firmware is unavailable until the next system boot\n");
 		return -EIO;
 	}
 
-	/* The firmware starts with new rings. */
-	isp->ipc_stale = NULL;
-	isp->ipc_failed = false;
-
 	/* Needs to be power cycled for IOMMU to behave correctly */
+	apple_isp_pm_step(isp, "boot: power up");
 	err = pm_runtime_resume_and_get(isp->dev);
 	if (err < 0) {
 		dev_err(isp->dev, "failed to enable power: %d\n", err);
+		if (isp->hw->resident_fw) {
+			isp->fw_state = ISP_FW_DEAD;
+			return -EIO;
+		}
 		return err;
 	}
 
 	err = isp_firmware_boot(isp);
 	if (err) {
 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
-		pm_runtime_put_sync(isp->dev);
-		if (isp->hw->resident_fw)
+		if (isp->hw->resident_fw) {
+			/* Never gate ISP CPU domains after an unsuccessful start. */
 			isp->fw_state = ISP_FW_DEAD;
+			return -EIO;
+		}
+		pm_runtime_put_sync(isp->dev);
 		return err;
 	}
 
 	isp->fw_state = ISP_FW_RUNNING;
+	apple_isp_pm_trace(isp, "boot: running");
 
 	return 0;
 }
@@ -1088,20 +1021,10 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 /* The end of a stream or of the camera detection at probe */
 void apple_isp_firmware_shutdown(struct apple_isp *isp)
 {
-	if (!isp->hw->resident_fw) {
-		apple_isp_firmware_halt(isp);
+	if (isp->hw->resident_fw)
 		return;
-	}
 
-	/*
-	 * Resident firmware keeps running, so the surfaces it allocated for
-	 * the stream and freed again are not collected by a firmware stop.
-	 * The stream has stopped, so free them now: wait for the interrupt
-	 * thread to finish the free requests the firmware has already sent.
-	 */
-	if (isp->fw_state == ISP_FW_RUNNING)
-		synchronize_irq(isp->irq);
-	isp_free_released_surfaces(isp);
+	apple_isp_firmware_halt(isp);
 }
 
 /* Stop the firmware; resident firmware cannot be started again. */
@@ -1113,8 +1036,12 @@ void apple_isp_firmware_halt(struct apple_isp *isp)
 	if (isp->fw_state != ISP_FW_RUNNING)
 		return;
 
+	apple_isp_pm_trace(isp, "halt");
 	isp_firmware_shutdown(isp);
+	if (isp->fw_state == ISP_FW_DEAD)
+		return;
+	apple_isp_pm_step(isp, "halt: power down");
 	pm_runtime_put_sync(isp->dev);
-	isp->ipc_stale = NULL;
 	isp->fw_state = isp->hw->resident_fw ? ISP_FW_DEAD : ISP_FW_OFF;
+	apple_isp_pm_trace(isp, "halted");
 }
