@@ -39,7 +39,8 @@ obj-$(CONFIG_VMD) += vmd.o
 obj-$(CONFIG_PCIE_BRCMSTB) += pcie-brcmstb.o
 obj-$(CONFIG_PCI_LOONGSON) += pci-loongson.o
 obj-$(CONFIG_PCIE_HISI_ERR) += pcie-hisi-error.o
-obj-$(CONFIG_PCIE_APPLE) += pcie-apple.o
+obj-$(CONFIG_PCIE_APPLE) += pcie-apple.o pcie-apple-piodma.o
+obj-$(CONFIG_PCIE_APPLE_MSI) += pcie-apple-msi.o
 obj-$(CONFIG_PCIE_MT7621) += pcie-mt7621.o
 obj-$(CONFIG_PCIE_ASPEED) += pcie-aspeed.o
 
@@ -68,3 +69,4 @@ endif
 endif
 
 obj-$(CONFIG_PCIE_APPLE_PIODMA_DIAG) += pcie-apple-piodma-diag.o
+obj-$(CONFIG_PCIE_APPLE_APIF) += apple-apif/
