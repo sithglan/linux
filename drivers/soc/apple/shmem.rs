@@ -132,11 +132,7 @@ fn verify_layout(
     capacity: usize,
     first_item: &[u8; 4],
 ) -> Result<()> {
-    let regions = [
-        (first_item, cinp),
-        (FOURCC_OPLA, opla),
-        (FOURCC_IPIS, ipis),
-    ];
+    let regions = [(first_item, cinp), (FOURCC_OPLA, opla), (FOURCC_IPIS, ipis)];
 
     for (name, r) in regions {
         let bad = r.offset < PAYLOAD_BASE

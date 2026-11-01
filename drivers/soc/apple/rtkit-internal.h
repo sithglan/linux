@@ -13,7 +13,6 @@
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
-#include <linux/kfifo.h>
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/mailbox.h>
@@ -42,9 +41,9 @@ struct apple_rtkit {
 	struct apple_mbox *mbox;
 
 	struct completion epmap_completion;
-	struct completion coreanalytics_completion;
 	struct completion iop_pwr_ack_completion;
 	struct completion ap_pwr_ack_completion;
+	struct completion iop_idle_completion;
 
 	int boot_result;
 	int version;
@@ -52,24 +51,23 @@ struct apple_rtkit {
 	unsigned int iop_power_state;
 	unsigned int ap_power_state;
 	bool crashed;
+	bool adopted;
+	bool awaiting_iop_idle;
+	bool epmap_only;
+	bool firmware_owned_crashlog;
+	bool t8152_pmp;
+	/* J873 or the J700 hybrid tree: keep the j873 baseline's RTKit rules. */
+	bool aurora_rules;
+	bool crashlog_endpoint_started;
+	bool hello_seen;
+	bool epmap_finished;
 	bool shutting_down;
-	/*
-	 * apple,sync-syslog-ack (AsahiLinux/linux#607, the T8122 dcpext):
-	 * acknowledge syslog and ioreport traffic ahead of other receive work,
-	 * hand out kdebug buffers, and poll the mailbox while waiting.
-	 */
-	bool sync_syslog_ack;
-	DECLARE_KFIFO(sync_ack_fifo, struct apple_mbox_msg, 64);
-	struct work_struct sync_ack_work;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 
 	struct apple_rtkit_shmem ioreport_buffer;
-	struct apple_rtkit_shmem coreanalytics_buffer;
 	struct apple_rtkit_shmem crashlog_buffer;
 	struct apple_rtkit_shmem oslog_buffer;
-	struct apple_rtkit_shmem kdebug_buffer0;
-	struct apple_rtkit_shmem kdebug_buffer1;
 	struct apple_rtkit_shmem pmp_aux_buffer;
 	bool pmp_registry_v2;
 
@@ -80,11 +78,11 @@ struct apple_rtkit {
 	/* Session inherited from the bootloader: INIT geometry never observed. */
 	bool syslog_inherited;
 	bool crashlog_inherited;
-	bool oslog_inherited;
 
 	struct workqueue_struct *wq;
 };
 
 void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size);
+bool apple_rtkit_crashlog_present(const u8 *bfr, size_t size);
 
 #endif

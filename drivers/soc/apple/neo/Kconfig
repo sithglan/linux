@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menu "Apple T8140 (J700) platform power and fabric"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on ARM64
+
+config APPLE_T8140_MCC
+	tristate "Apple T8140 system-level cache allocation owner"
+	default y if ARCH_APPLE
+	help
+	  Enable system-level-cache allocation at boot on J700 (T8140), as the
+	  native AppleT8140MCC driver does (mccEnableCacheMode step 3: AMCC
+	  +0x82c = 0 on every plane, only when every plane already reports its
+	  ways enabled and powered). Resume re-applies it and reboot, poweroff
+	  and kexec run the native quiesce cache flush. On other machines the
+	  driver does nothing.
+
+	  Measured on J700: CPU memory latency ~100 -> 30 ns, and GPU depth-1
+	  and depth-2 throughput +19-33%. Opt out with neo_mcc.enable=0.
+
+config APPLE_T8140_PMC_VOTERS
+	tristate "Apple T8140 PMC voter-interface enables"
+	help
+	  Apply the macOS restorePMC static voter enables (PMP, CLPC and AP
+	  agents on each rail) and optionally drive the GFX dynamic voter from
+	  the GFX power-domain notifier, in the native order. The default
+	  (active=0) only reports status. The lab bring-up loads it with
+	  active=1 gfx_voter=0 after the PMP runs.
+
+config APPLE_T8140_PMP_DASHBOARD
+	tristate "Apple T8140 host-to-PMP device-state dashboard reports"
+	help
+	  Report host device power state to a running PMP through the PMP
+	  dashboard, as ApplePMGR's PMP-interface v2 path does
+	  (_pmpWriteDashBoardSetDeviceState, with the native ack wait for
+	  devices that require one). The default (active=0) is read-only. It
+	  does nothing unless the PMP firmware is running.
+
+config APPLE_T8140_CLPC_FLOORS
+	tristate "Apple T8140 CPU/GPU memory and fabric demand floors"
+	help
+	  Write DCS/SOC performance-state floors on the PMC CLPC voter agent
+	  from CPU cluster (and optionally GPU) activity, modelled on
+	  AppleT8140CLPC. The native demand tables are not decoded; the default
+	  (active=0) computes and reports only. force_dcs/force_soc are
+	  diagnostic holds and default to -1 (off).
+
+endmenu

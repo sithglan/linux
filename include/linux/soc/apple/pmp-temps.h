@@ -1,4 +1,12 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+/*
+ * Temperature records the running PMP firmware publishes in its SRAM:
+ * a NUL-terminated name, the sample (signed, 1/64 degC) at +0x34 and a
+ * valid word (1) at +0x40, 0x44 bytes in all. The T8132 (J713) table is
+ * Erik Bourget's and Eryk Wieliczko's (erikwb/linux j713/daily); T8142
+ * (J813) has the same record format at other offsets, with the records the
+ * firmware marks valid on a running J813.
+ */
 #ifndef _LINUX_SOC_APPLE_PMP_TEMPS_H
 #define _LINUX_SOC_APPLE_PMP_TEMPS_H
 
@@ -7,31 +15,64 @@
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
-/* Read-only T8132 firmware records; shared by hwmon and thermal clients. */
-#define PMP_TEMP_SRAM_BASE	0x380500000ULL
-#define PMP_TEMP_SRAM_SIZE	0xc0000
 #define PMP_TEMP_RECORD_SIZE	0x44
 #define PMP_TEMP_SAMPLE_OFFSET	0x34
 #define PMP_TEMP_VALID_OFFSET	0x40
 #define PMP_TEMP_READ_ATTEMPTS	20
-#define PMP_TEMP_CHANNELS	6
 
 /* Firmware identifiers do not establish the physical placement of sensors. */
-static const struct apple_pmp_temp_record {
+struct apple_pmp_temp_record {
 	const char *name;
 	const char *label;
 	u32 offset;
-} apple_pmp_temp_records[] = {
+};
+
+struct apple_pmp_temp_table {
+	const char *compatible;
+	const struct apple_pmp_temp_record *records;
+	unsigned int count;
+};
+
+static const struct apple_pmp_temp_record apple_pmp_temp_records_t8132[] = {
 	{ "ta000m", "Ta000m", 0x68624 },
 	{ "te000m", "Te000m", 0x686c8 },
 	{ "te001m", "Te001m", 0x6876c },
 	{ "tp000m", "Tp000m", 0x68810 },
 	{ "tp001m", "Tp001m", 0x688b4 },
-	/* No individual channel: include only valid samples in the hotspot. */
 	{ "tp002m", "Tp002m", 0x68958 },
 };
 
-static inline int apple_pmp_temp_decode(const u8 *record, const char *name, long *value)
+/* 0xa4 apart, as on T8132; ta000i-ta006i and te003i read invalid. */
+static const struct apple_pmp_temp_record apple_pmp_temp_records_t8142[] = {
+	{ "ta007i", "Ta007i", 0x7a9a8 },
+	{ "tp000i", "Tp000i", 0x7aa4c },
+	{ "tp001i", "Tp001i", 0x7aaf0 },
+	{ "tp003i", "Tp003i", 0x7ab94 },
+	{ "tp004i", "Tp004i", 0x7ac38 },
+	{ "tp00li", "Tp00li", 0x7acdc },
+	{ "tp00mi", "Tp00mi", 0x7ad80 },
+	{ "tp00ni", "Tp00ni", 0x7ae24 },
+	{ "tp00oi", "Tp00oi", 0x7aec8 },
+	{ "tp00pi", "Tp00pi", 0x7af6c },
+	{ "tp00ri", "Tp00ri", 0x7b010 },
+	{ "tp009i", "Tp009i", 0x7b0b4 },
+	{ "tp00ai", "Tp00ai", 0x7b158 },
+	{ "tp006i", "Tp006i", 0x7b1fc },
+	{ "tp007i", "Tp007i", 0x7b2a0 },
+	{ "te007i", "Te007i", 0x7b344 },
+	{ "te001i", "Te001i", 0x7b3e8 },
+	{ "te002i", "Te002i", 0x7b48c },
+};
+
+static const struct apple_pmp_temp_table apple_pmp_temp_tables[] = {
+	{ "apple,t8132-pmp-v2", apple_pmp_temp_records_t8132,
+	  ARRAY_SIZE(apple_pmp_temp_records_t8132) },
+	{ "apple,t8142-pmp-v2", apple_pmp_temp_records_t8142,
+	  ARRAY_SIZE(apple_pmp_temp_records_t8142) },
+};
+
+static inline int apple_pmp_temp_decode(const u8 *record, const char *name,
+					long *value)
 {
 	s32 sample;
 
@@ -48,56 +89,25 @@ static inline int apple_pmp_temp_decode(const u8 *record, const char *name, long
 	return 0;
 }
 
-static inline int apple_pmp_temp_sample(void __iomem *sram, unsigned int index,
+/* Word reads only; the record is read twice until both copies agree. */
+static inline int apple_pmp_temp_sample(void __iomem *sram,
+					const struct apple_pmp_temp_record *record,
 					long *value)
 {
-	const struct apple_pmp_temp_record *record = &apple_pmp_temp_records[index];
-	u8 first[PMP_TEMP_RECORD_SIZE], second[PMP_TEMP_RECORD_SIZE];
-	unsigned int attempt;
+	u32 first[PMP_TEMP_RECORD_SIZE / 4], second[PMP_TEMP_RECORD_SIZE / 4];
+	unsigned int attempt, i;
 
 	for (attempt = 0; attempt < PMP_TEMP_READ_ATTEMPTS; attempt++) {
-		memcpy_fromio(first, sram + record->offset, sizeof(first));
-		memcpy_fromio(second, sram + record->offset, sizeof(second));
+		for (i = 0; i < ARRAY_SIZE(first); i++)
+			first[i] = readl(sram + record->offset + 4 * i);
+		for (i = 0; i < ARRAY_SIZE(second); i++)
+			second[i] = readl(sram + record->offset + 4 * i);
 		if (!memcmp(first, second, sizeof(first)))
-			return apple_pmp_temp_decode(first, record->name, value);
+			return apple_pmp_temp_decode((const u8 *)first,
+						     record->name, value);
 	}
 
 	return -EAGAIN;
-}
-
-static inline int apple_pmp_temp_hotspot_channel(void __iomem *sram, long *value,
-					       int *channel)
-{
-	bool found = false;
-	long hottest = 0, sample;
-	unsigned int i;
-	int ret;
-
-	*channel = -1;
-	for (i = 0; i < ARRAY_SIZE(apple_pmp_temp_records); i++) {
-		ret = apple_pmp_temp_sample(sram, i, &sample);
-		if (ret == -ENODATA)
-			continue;
-		if (ret)
-			return ret;
-		if (!found || sample > hottest) {
-			hottest = sample;
-			*channel = i;
-		}
-		found = true;
-	}
-
-	if (!found)
-		return -ENODATA;
-	*value = hottest;
-	return 0;
-}
-
-static inline int apple_pmp_temp_hotspot(void __iomem *sram, long *value)
-{
-	int channel;
-
-	return apple_pmp_temp_hotspot_channel(sram, value, &channel);
 }
 
 #endif

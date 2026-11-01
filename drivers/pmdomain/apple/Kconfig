@@ -89,6 +89,20 @@ config APPLE_PMP_REPORT_START_KUNIT_TEST
 	  start or a consumer waits. The report region is simulated in
 	  memory. Only useful for kernel developers.
 
+config APPLE_PMC
+	bool "Apple PMC voter interface"
+	depends on OF
+	depends on PM
+	select PM_GENERIC_DOMAINS
+	default ARCH_APPLE
+	help
+	  The PMC in some Apple SoCs arbitrates the performance states of
+	  shared rails, such as the DRAM controller and the SoC fabric,
+	  between voter agents. This driver enables the static agents and
+	  provides power domains that enable a dynamic agent, such as the
+	  GPU, while its device is powered on. It can also limit the DRAM
+	  controller rail as a thermal cooling device.
+
 endif
 
 config APPLE_PMP_REPORT_KUNIT_TEST
