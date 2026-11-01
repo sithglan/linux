@@ -15,7 +15,6 @@
 
 #define DCP_FORMAT_BGRA		fourcc_code('A', 'R', 'G', 'B')
 #define DCP_FORMAT_RGBA		fourcc_code('A', 'B', 'G', 'R')
-#define DCP_FORMAT_AhGR		fourcc_code('A', 'h', 'G', 'R') /* 16-bit half float ABGR */
 
 #define DCP_FORMAT_W30R		fourcc_code('r', '0', '3', 'w')	// wide gamut packed 10-bit RGB without alpha
 #define DCP_FORMAT_L10R		fourcc_code('r', '0', '1', 'l')	// full range packed 10-bit RGB with alpha
@@ -35,14 +34,6 @@
 #define DCP_FORMAT_XF22		fourcc_code('2', '2', 'f', 'x')	// P210 full range 2 plane 10-bit YCbCR
 #define DCP_FORMAT_XF44		fourcc_code('4', '4', 'f', 'x')	// P410 full range 2 plane 10-bit YCbCR
 
-#define DCP_FORMAT_P420		fourcc_code('0', '2', '4', 'p') /* P030 video range 2 plane 10-bit YCbCr, 3x1 blocks */
-#define DCP_FORMAT_P422		fourcc_code('2', '2', '4', 'p') /* P230 video range 2 plane 10-bit YCbCr, 3x1 blocks */
-#define DCP_FORMAT_P444		fourcc_code('4', '4', '4', 'p') /* P430 video range 2 plane 10-bit YCbCr, 3x1 blocks */
-
-#define DCP_FORMAT_PF20		fourcc_code('0', '2', 'f', 'p') /* P030 full range 2 plane 10-bit YCbCr, 3x1 blocks */
-#define DCP_FORMAT_PF22		fourcc_code('2', '2', 'f', 'p') /* P230 full range 2 plane 10-bit YCbCr, 3x1 blocks */
-#define DCP_FORMAT_PF44		fourcc_code('4', '4', 'f', 'p') /* P430 full range 2 plane 10-bit YCbCr, 3x1 blocks */
-
 enum dcp_colorspace {
 	DCP_COLORSPACE_BG_SRGB = 0,
 	DCP_COLORSPACE_BT601 = 1,
@@ -56,24 +47,6 @@ enum dcp_xfer_func {
 	DCP_XFER_FUNC_BT1886 = 2,
 	DCP_XFER_FUNC_SDR = 13,
 	DCP_XFER_FUNC_HDR = 16,
-};
-
-enum dcp_addr_fmt {
-	DCP_ADDR_FMT_LINEAR = 0,
-	/* Twiddled layout supported by AGX */
-	DCP_ADDR_FMT_GPU_TWIDDLED = 2,
-	/* Tiled layout supported by AGX */
-	DCP_ADDR_FMT_GPU_TILED = 3,
-	/* Tiled layout used for buffers shared between hardware blocks */
-	DCP_ADDR_FMT_INTERCHANGE_TILED = 5,
-};
-
-enum dcp_compression_type {
-	DCP_COMPRESSION_NONE = 0,
-	/* Optional for GPU_TWIDDLED and GPU_TILED */
-	DCP_COMPRESSION_AGX = 2,
-	/* Always required for INTERCHANGE_TILED */
-	DCP_COMPRESSION_INTERCHANGE = 3,
 };
 
 struct dcp_rect {
@@ -94,44 +67,13 @@ struct dcp_plane_info {
 	u16 tile_size;
 	u8 tile_w;
 	u8 tile_h;
-	u8 unk[0xd];
-	u8 address_fmt;
-	u8 unk3[0x26];
+	u32 unk[13];
 } __packed;
 
 struct dcp_component_types {
 	u8 count;
 	u8 types[7];
 } __packed;
-
-struct dcp_compression_info {
-	u32 tile_w;
-	u32 tile_h;
-	u32 metadata_offset;
-	u32 data_offset;
-	u32 meta_bytes;
-	u32 tiles_w;
-	u32 tiles_h;
-	u32 unk_1;
-	u32 compression_type;
-	u32 unk3;
-	u8 padding[3];
-	u32 tile_bytes;
-	u32 row_stride;
-	u8 pad2;
-} __packed;
-
-struct dcp_image_layout {
-	u32 tile_w;
-	u32 tile_h;
-	u32 width_tiles;
-	u32 height_tiles;
-	u32 tile_bytes;
-	/* For compressed layouts */
-	u32 meta_offset;
-	u32 meta_size;
-	u32 meta_tile_bytes;
-};
 
 /* Information describing a surface */
 struct dcp_surface {
@@ -158,7 +100,7 @@ struct dcp_surface {
 	u64 has_comp;
 	struct dcp_plane_info planes[DCP_SURF_MAX_PLANES];
 	u64 has_planes;
-	struct dcp_compression_info compression_info[DCP_SURF_MAX_PLANES];
+	u32 compression_info[DCP_SURF_MAX_PLANES][13];
 	u64 has_compr_info;
 	u32 unk_num;
 	u32 unk_denom;

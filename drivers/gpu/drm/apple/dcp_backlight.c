@@ -5,15 +5,12 @@
 #include <drm/drm_crtc.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_modeset_lock.h>
-#include <drm/drm_print.h>
 
 #include <linux/backlight.h>
-#include <linux/math64.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include "linux/jiffies.h"
 
-#include "connector.h"
 #include "dcp.h"
 #include "dcp-internal.h"
 
@@ -85,85 +82,11 @@ static u32 brightness_part2[] = {
 };
 
 
-/*
- * A new level fades in over DCP_BL_FADE_MS, one brightness-only present per
- * step at most.  Steps that come faster than presents complete merge, so the
- * step only bounds how smooth the fade can be.
- */
-#define DCP_BL_FADE_MS		250U
-#define DCP_BL_FADE_STEP_MS	16U
-
 bool dcp_backlight_active(struct apple_dcp *dcp)
 {
-	return ((dcp->fw_compat == DCP_FIRMWARE_H17P &&
-		 dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
-		iomfb_is_m4(dcp)) &&
+	return dcp->fw_compat >= DCP_FIRMWARE_H17P &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		READ_ONCE(dcp->backlight.state.ready);
-}
-
-static bool dcp_backlight_desktop(struct apple_dcp *dcp)
-{
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-		READ_ONCE(dcp->backlight.state.ready);
-}
-
-static void dcp_backlight_desktop_kick(struct apple_dcp *dcp)
-{
-	if (!READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->crashed))
-		schedule_work(&dcp->bl_update_wq);
-}
-
-/*
- * Match the backlight core's change event without force_update(), which
- * would replace a user's target with an intermediate fade level.
- */
-static void dcp_backlight_notify_work(struct work_struct *work)
-{
-	struct apple_dcp *dcp = container_of(work, struct apple_dcp, backlight.notify_work);
-	struct backlight_device *bd = READ_ONCE(dcp->brightness.bl_dev);
-	char *envp[2];
-
-	if (!bd || READ_ONCE(dcp->quiescing))
-		return;
-	envp[0] = "SOURCE=unknown";
-	envp[1] = NULL;
-	kobject_uevent_env(&bd->dev.kobj, KOBJ_CHANGE, envp);
-	sysfs_notify(&bd->dev.kobj, NULL, "brightness");
-	sysfs_notify(&bd->dev.kobj, NULL, "actual_brightness");
-}
-
-/* Run before the later-registered backlight devres unregisters the device. */
-static void dcp_backlight_notify_release(void *data)
-{
-	struct apple_dcp *dcp = data;
-
-	WRITE_ONCE(dcp->brightness.bl_dev, NULL);
-	cancel_work_sync(&dcp->backlight.notify_work);
-}
-
-static void dcp_backlight_notify(struct apple_dcp *dcp)
-{
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	    !READ_ONCE(dcp->quiescing) && READ_ONCE(dcp->brightness.bl_dev))
-		schedule_work(&dcp->backlight.notify_work);
-}
-
-/* A loader hint describes the inherited level, not a new brightness request. */
-static void dcp_backlight_sync_hint(struct apple_dcp *dcp)
-{
-	struct backlight_device *bd = READ_ONCE(dcp->brightness.bl_dev);
-	unsigned long flags;
-
-	if (!bd)
-		return;
-	/* Match update_status's lock order and never replace a user's target. */
-	mutex_lock(&bd->ops_lock);
-	spin_lock_irqsave(&dcp->backlight.lock, flags);
-	if (!dcp->backlight.state.controlled && dcp->backlight.state.level_known)
-		bd->props.brightness = dcp->backlight.state.target;
-	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-	mutex_unlock(&bd->ops_lock);
-	dcp_backlight_notify(dcp);
 }
 
 int dcp_backlight_takeover(struct apple_dcp *dcp, u32 millinits)
@@ -171,48 +94,13 @@ int dcp_backlight_takeover(struct apple_dcp *dcp, u32 millinits)
 	u32 maximum, nits;
 	int ret;
 
+	if (dcp_backlight_active(dcp))
+		return 0;
 	/* H17P takes nits up to the panel ceiling, not the older DAC table's. */
 	maximum = dcp->brightness.maximum;
 	ret = dcp_bl_takeover_nits(maximum, millinits, &nits);
 	if (ret)
 		return ret;
-
-	if (dcp_backlight_active(dcp) ||
-	    (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	     READ_ONCE(dcp->backlight.state.ready))) {
-		unsigned long flags;
-		bool seeded;
-
-		spin_lock_irqsave(&dcp->backlight.lock, flags);
-		seeded = dcp_bl_report(&dcp->backlight.state, nits);
-		if (seeded && dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
-			dcp->desktop->inherited_brightness = nits;
-			dcp->desktop->inherited_brightness_valid = true;
-		}
-		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-		if (seeded)
-			dcp_backlight_sync_hint(dcp);
-		return 0;
-	}
-
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
-		unsigned long flags;
-		bool seeded = false;
-
-		/* Accept the first hint until a user request takes ownership. */
-		spin_lock_irqsave(&dcp->backlight.lock, flags);
-		if (!dcp->desktop->inherited_brightness_valid &&
-		    !dcp->backlight.state.controlled) {
-			dcp->desktop->inherited_brightness = nits;
-			dcp->desktop->inherited_brightness_valid = true;
-			if (dcp->backlight.state.ready)
-				seeded = dcp_bl_report(&dcp->backlight.state, nits);
-		}
-		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-		if (seeded)
-			dcp_backlight_sync_hint(dcp);
-		return 0;
-	}
 
 	/* Keep the first bounded hint. Later reports are not user requests. */
 	return iomfb_configure_backlight_h17p(dcp, maximum, true, nits, false, 0);
@@ -222,17 +110,14 @@ static int dcp_get_brightness(struct backlight_device *bd)
 {
 	struct apple_dcp *dcp = bl_get_data(bd);
 	unsigned long flags;
-	int actual;
+	u32 actual;
 
 	if (READ_ONCE(dcp->quiescing))
 		return -ENODEV;
 
-	if (dcp_backlight_active(dcp) || dcp_backlight_desktop(dcp)) {
+	if (dcp_backlight_active(dcp)) {
 		spin_lock_irqsave(&dcp->backlight.lock, flags);
-		if (dcp_backlight_desktop(dcp))
-			actual = dcp_bl_actual(&dcp->backlight.state);
-		else
-			actual = dcp->backlight.state.actual;
+		actual = dcp->backlight.state.actual;
 		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 		return actual;
 	}
@@ -248,9 +133,8 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 	unsigned long flags;
 	int ret;
 
-	if ((dcp->fw_compat != DCP_FIRMWARE_H17P &&
-	     !iomfb_is_m4(dcp)) ||
-	    !dcp_has_panel(dcp) || !dcp->crtc || !kick)
+	if (dcp->fw_compat < DCP_FIRMWARE_H17P || !dcp_has_panel(dcp) ||
+	    !dcp->crtc || !kick)
 		return -EINVAL;
 
 	mutex_lock(&dcp->bl_register_mutex);
@@ -261,17 +145,8 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 		ret = dcp_bl_init(&dcp->backlight.state, maximum,
 				  inherited_valid, inherited,
 				  default_valid, default_nits);
-		if (!ret && iomfb_is_m4(dcp)) {
-			/*
-			 * The J713 panel jumps to new levels, and its first
-			 * present carries the requested level.
-			 */
-			dcp_bl_jump(&dcp->backlight.state);
+		if (!ret)
 			dcp->backlight.kick = kick;
-		} else if (!ret) {
-			dcp->backlight.state.fade = true;
-			dcp->backlight.kick = kick;
-		}
 	}
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	mutex_unlock(&dcp->bl_register_mutex);
@@ -297,85 +172,6 @@ static void dcp_backlight_kick(struct apple_dcp *dcp)
 
 	if (kick)
 		kick(dcp);
-}
-
-static void dcp_backlight_fade_work(struct work_struct *work)
-{
-	struct apple_dcp *dcp = container_of(to_delayed_work(work),
-					     struct apple_dcp,
-					     backlight.fade_work);
-	unsigned long flags;
-	bool running, kick;
-	u32 elapsed;
-
-	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed) ||
-	    READ_ONCE(dcp->iomfb.stopped))
-		return;
-
-	spin_lock_irqsave(&dcp->backlight.lock, flags);
-	elapsed = jiffies_to_msecs(jiffies - dcp->backlight.fade_start);
-	running = dcp_bl_fade_step(&dcp->backlight.state, elapsed,
-				   DCP_BL_FADE_MS);
-	/* A rejected present is retried with backoff, carrying the new level. */
-	kick = dcp->backlight.state.dirty && !dcp->backlight.state.retries;
-	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-
-	if (kick)
-		dcp_backlight_kick(dcp);
-	if (running)
-		queue_delayed_work(system_dfl_wq, &dcp->backlight.fade_work,
-				   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
-}
-
-static void dcp_backlight_retry_work(struct work_struct *work)
-{
-	struct apple_dcp *dcp = container_of(to_delayed_work(work),
-					     struct apple_dcp, backlight.retry_work);
-
-	if (!READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->crashed))
-		dcp_backlight_kick(dcp);
-}
-
-void dcp_backlight_stop(struct apple_dcp *dcp)
-{
-	cancel_delayed_work_sync(&dcp->backlight.fade_work);
-	cancel_delayed_work_sync(&dcp->backlight.retry_work);
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
-		cancel_work_sync(&dcp->backlight.notify_work);
-}
-
-static void dcp_backlight_release(void *data)
-{
-	dcp_backlight_stop(data);
-}
-
-/*
- * The backlight device is a devres of @dev, registered after probe, so it is
- * unregistered before this action runs, and no request can start a fade
- * afterwards.
- */
-int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev)
-{
-	spin_lock_init(&dcp->backlight.lock);
-	INIT_DELAYED_WORK(&dcp->backlight.fade_work, dcp_backlight_fade_work);
-	INIT_WORK(&dcp->backlight.notify_work, dcp_backlight_notify_work);
-	INIT_DELAYED_WORK(&dcp->backlight.retry_work, dcp_backlight_retry_work);
-	return devm_add_action_or_reset(dev, dcp_backlight_release, dcp);
-}
-
-/* Present the target of a running fade at once, e.g. before system sleep. */
-void dcp_backlight_finish_fade(struct apple_dcp *dcp)
-{
-	unsigned long flags;
-	bool kick;
-
-	cancel_delayed_work_sync(&dcp->backlight.fade_work);
-	spin_lock_irqsave(&dcp->backlight.lock, flags);
-	dcp_bl_fade_step(&dcp->backlight.state, DCP_BL_FADE_MS, DCP_BL_FADE_MS);
-	kick = dcp->backlight.state.dirty;
-	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-	if (kick)
-		dcp_backlight_kick(dcp);
 }
 
 int dcp_backlight_dpms(struct apple_dcp *dcp, bool on)
@@ -464,83 +260,6 @@ unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp)
 	return delay;
 }
 
-/* Power changes jump; a target chosen while off is restored on enable. */
-void dcp_backlight_desktop_power(struct apple_dcp *dcp, bool on)
-{
-	unsigned long flags;
-
-	if (!dcp_backlight_desktop(dcp))
-		return;
-	if (!on)
-		dcp_backlight_stop(dcp);
-	spin_lock_irqsave(&dcp->backlight.lock, flags);
-	dcp->backlight.state.dpms_off = !on;
-	if (dcp->backlight.state.controlled)
-		dcp_bl_jump(&dcp->backlight.state);
-	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-}
-
-/* Reserve only after swap_start succeeds, using its actual firmware ID. */
-bool dcp_backlight_desktop_prepare(struct apple_dcp *dcp, u32 id,
-				   bool have_surface, u32 *nits)
-{
-	unsigned long flags;
-	int ret;
-
-	if (!dcp_backlight_desktop(dcp))
-		return false;
-	spin_lock_irqsave(&dcp->backlight.lock, flags);
-	ret = dcp_bl_swap_prepare(&dcp->backlight.state,
-				  &dcp->desktop->backlight, id, have_surface);
-	if (!ret)
-		*nits = dcp->desktop->backlight.present.nits;
-	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-	return !ret;
-}
-
-/* The panel level in nits, 0 while it is unknown. */
-u32 dcp_backlight_desktop_nits(struct apple_dcp *dcp)
-{
-	unsigned long flags;
-	int nits;
-
-	if (!dcp_backlight_desktop(dcp))
-		return 0;
-	spin_lock_irqsave(&dcp->backlight.lock, flags);
-	nits = dcp_bl_actual(&dcp->backlight.state);
-	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-	return nits > 0 ? nits : 0;
-}
-
-void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
-				  bool reply, bool accepted)
-{
-	unsigned long flags;
-	unsigned int delay;
-	bool finished, pending, changed;
-	int previous;
-
-	if (!dcp_backlight_desktop(dcp))
-		return;
-	spin_lock_irqsave(&dcp->backlight.lock, flags);
-	previous = dcp_bl_actual(&dcp->backlight.state);
-	finished = dcp_bl_swap_finish(&dcp->backlight.state,
-				      &dcp->desktop->backlight, id, reply, accepted);
-	changed = previous != dcp_bl_actual(&dcp->backlight.state);
-	delay = dcp_bl_retry_delay(&dcp->backlight.state);
-	pending = dcp->backlight.state.dirty;
-	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-	if (changed)
-		dcp_backlight_notify(dcp);
-	if (!finished || READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed))
-		return;
-	if (delay)
-		mod_delayed_work(system_dfl_wq, &dcp->backlight.retry_work,
-				 msecs_to_jiffies(delay));
-	else if (pending && (!reply || accepted))
-		dcp_backlight_kick(dcp);
-}
-
 #define SCALE_FACTOR (1 << 10)
 
 static u32 interpolate(int val, int min, int max, u32 *tbl, size_t tbl_size)
@@ -590,57 +309,47 @@ static u32 calculate_dac(struct apple_dcp *dcp, int val)
 
 static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 {
-	struct drm_atomic_commit *commit;
+	struct drm_atomic_commit *state;
 	struct drm_crtc_state *crtc_state;
 	struct drm_modeset_acquire_ctx ctx;
 	struct drm_crtc *crtc = &dcp->crtc->base;
-	int ret;
+	int ret = 0;
 
-	commit = drm_atomic_commit_alloc(crtc->dev);
-	if (!commit)
+	state = drm_atomic_commit_alloc(crtc->dev);
+	if (!state)
 		return -ENOMEM;
 
 	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
-	commit->acquire_ctx = &ctx;
+	state->acquire_ctx = &ctx;
+
 retry:
-	ret = drm_modeset_lock(&crtc->mutex, &ctx);
-	if (ret)
-		goto out;
-
-	if (dcp_backlight_desktop(dcp) ? !dcp_backlight_pending(dcp) :
-	    !dcp->brightness.update)
-		goto out;
-
-	crtc_state = drm_atomic_get_crtc_state(commit, crtc);
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
 	if (IS_ERR(crtc_state)) {
 		ret = PTR_ERR(crtc_state);
 		goto out;
 	}
 
-	/* A request made while DPMS is off is restored on the enable swap. */
-	if (dcp_backlight_desktop(dcp) && !crtc_state->active)
+	if (!dcp->brightness.update)
 		goto out;
 
 	/* Re-present the current scanout when brightness is the only change. */
-	ret = drm_atomic_add_affected_planes(commit, crtc);
+	ret = drm_atomic_add_affected_planes(state, crtc);
 	if (ret)
 		goto out;
 
-	if (dcp_backlight_desktop(dcp))
-		crtc_state->planes_changed = true;
-	else
-		crtc_state->color_mgmt_changed = true;
+	crtc_state->color_mgmt_changed |= true;
 
-	ret = drm_atomic_commit(commit);
+	ret = drm_atomic_commit(state);
+
 out:
 	if (ret == -EDEADLK) {
-		drm_atomic_commit_clear(commit);
+		drm_atomic_commit_clear(state);
 		ret = drm_modeset_backoff(&ctx);
 		if (!ret)
 			goto retry;
 	}
 
-	drm_atomic_commit_put(commit);
+	drm_atomic_commit_put(state);
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
 
@@ -655,7 +364,7 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 		dcp_backlight_kick(dcp);
 		return 0;
 	}
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if (dcp->fw_compat >= DCP_FIRMWARE_H17P &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return -ENODATA;
 
@@ -670,8 +379,7 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 
 	/* Wait 1 vblank cycle in the hope an atomic swap has already updated
 	 * the brightness */
-	if (!dcp_backlight_desktop(dcp))
-		msleep((1001 + 23) / 24); // 42ms for 23.976 fps
+	msleep((1001 + 23) / 24); // 42ms for 23.976 fps
 
 	return drm_crtc_set_brightness(dcp);
 }
@@ -686,26 +394,15 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	if (READ_ONCE(dcp->quiescing))
 		return -ENODEV;
 
-	if (dcp_backlight_active(dcp) || dcp_backlight_desktop(dcp)) {
-		struct dcp_backlight_state *state = &dcp->backlight.state;
-		bool fade;
-		u32 old;
-
+	if (dcp_backlight_active(dcp)) {
 		/* Preserve the requested level even while the core forces zero. */
 		spin_lock_irqsave(&dcp->backlight.lock, flags);
-		old = state->target;
-		ret = dcp_bl_request(state, bd->props.brightness,
+		ret = dcp_bl_request(&dcp->backlight.state,
+				     bd->props.brightness,
 				     backlight_is_blank(bd),
 				     bd->props.state & BL_CORE_SUSPENDED);
-		/* A new level restarts the fade from the level presented last. */
-		fade = !ret && state->fading && state->target != old;
-		if (fade)
-			dcp->backlight.fade_start = jiffies;
 		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-		if (fade)
-			queue_delayed_work(system_dfl_wq, &dcp->backlight.fade_work,
-					   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
-		else if (!ret)
+		if (!ret)
 			dcp_backlight_kick(dcp);
 		return ret;
 	}
@@ -727,12 +424,6 @@ static bool dcp_backlight_controls_device(struct backlight_device *bd,
 {
 	struct apple_dcp *dcp = bl_get_data(bd);
 
-	/* A framebuffer's first unblank must not apply the reporting default. */
-	if (dcp_backlight_desktop(dcp) &&
-	    !READ_ONCE(dcp->backlight.state.level_known) &&
-	    !READ_ONCE(dcp->backlight.state.controlled))
-		return false;
-
 	return !display_dev || display_dev == dcp->dev ||
 		(dcp->crtc && display_dev == dcp->crtc->base.dev->dev);
 }
@@ -748,7 +439,6 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
 	struct backlight_device *bl_dev;
-	int ret;
 	unsigned long flags;
 	struct backlight_properties props = {
 		.type = BACKLIGHT_PLATFORM,
@@ -756,9 +446,8 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
 	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
-	if (((dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	      dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
-	     iomfb_is_m4(dcp)) &&
+	if (dcp->fw_compat >= DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    !dcp_backlight_active(dcp))
 		return -ENODATA;
 	if (dcp_backlight_active(dcp)) {
@@ -774,265 +463,14 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	}
 
-	/*
-	 * Desktop 26.x takes nits directly and publishes no initial level:
-	 * start from a default, which is not sent until userspace writes one.
-	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
-		if (!dcp->brightness.maximum || dcp->brightness.maximum > INT_MAX)
-			return -ERANGE;
-		props.max_brightness = dcp->brightness.maximum;
-		/* Match the Neo's reporting default without presenting a guess. */
-		props.brightness = props.max_brightness / 2;
-		spin_lock_irqsave(&dcp->backlight.lock, flags);
-		if (!dcp->backlight.state.ready) {
-			int ret = dcp_bl_init(&dcp->backlight.state, props.max_brightness,
-					      dcp->desktop->inherited_brightness_valid,
-					      dcp->desktop->inherited_brightness,
-					      true, props.brightness);
-
-			if (ret) {
-				spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-				return ret;
-			}
-			dcp->backlight.state.fade = true;
-			dcp->backlight.state.preserve_inherited = true;
-			dcp->backlight.kick = dcp_backlight_desktop_kick;
-		}
-		props.brightness = dcp->backlight.state.target;
-		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
-	}
-
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
 						&dcp_backlight_ops, &props);
 	if (IS_ERR(bl_dev))
 		return PTR_ERR(bl_dev);
 
-	/* LIFO devres order drains event work before unregistering the backlight. */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
-		ret = devm_add_action_or_reset(dev, dcp_backlight_notify_release, dcp);
-		if (ret)
-			return ret;
-	}
-	WRITE_ONCE(dcp->brightness.bl_dev, bl_dev);
-	/* A hint may have arrived between the property snapshot and registration. */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
-		dcp_backlight_sync_hint(dcp);
-	if (!dcp_backlight_active(dcp) &&
-	    dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP)
+	dcp->brightness.bl_dev = bl_dev;
+	if (!dcp_backlight_active(dcp))
 		dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
 
 	return 0;
-}
-
-/*
- * External displays that report SupportsBacklightControl, such as the Apple
- * Studio Display, take the same swap backlight fields as an integrated
- * panel.  bl_value is then a signed 32-bit level from 0 (dimmest) to S32_MAX
- * (brightest); DCP converts it for the display.  The backlight device belongs
- * to the connector, so userspace can tell which output it dims.
- */
-#define DCP_EXT_BL_MAX	1000
-
-/*
- * The bl_value for the display on this DCP, or -1 to send none: it has no
- * backlight, or userspace has not chosen a level yet, so the display keeps
- * its own.
- */
-s32 dcp_ext_backlight_value(struct apple_dcp *dcp)
-{
-	struct apple_connector *connector = READ_ONCE(dcp->connector);
-	int level;
-
-	if (!connector || !READ_ONCE(dcp->ext_backlight))
-		return -1;
-	/* H17P external swap brightness fields are unverified; leave them. */
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
-		return -1;
-
-	level = READ_ONCE(connector->bl_level);
-	if (level < 0)
-		return -1;
-
-	return div_u64((u64)level * S32_MAX, DCP_EXT_BL_MAX);
-}
-
-static int dcp_ext_backlight_update_status(struct backlight_device *bd)
-{
-	struct apple_connector *connector = bl_get_data(bd);
-	int level = bd->props.brightness;
-	struct platform_device *pdev;
-	struct apple_dcp *dcp;
-
-	/*
-	 * The display's power belongs to DRM: fbdev blanking never reaches
-	 * this device (controls_device), and bl_power does not turn the
-	 * display off, so the level is stored and sent whatever their state.
-	 *
-	 * Until a level is chosen the device reports DCP_EXT_BL_MAX, and
-	 * systemd-backlight writes what it reads back when it has nothing
-	 * saved. Sending that would turn the display to full brightness.
-	 */
-	if (READ_ONCE(connector->bl_level) < 0 && level == DCP_EXT_BL_MAX)
-		return 0;
-
-	WRITE_ONCE(connector->bl_level, level);
-
-	/* An unrouted port picks the level up when it powers on again. */
-	pdev = READ_ONCE(connector->dcp);
-	if (!pdev)
-		return 0;
-
-	dcp = platform_get_drvdata(pdev);
-	/* Pairs with do_swap(): it sees the level or leaves update set. */
-	smp_store_release(&dcp->brightness.update, true);
-
-	/*
-	 * Commit from a work item: a slider's stream of writes collapses into
-	 * a few commits, and none of them blocks with ops_lock held.
-	 */
-	schedule_work(&connector->bl_commit_wq);
-	return 0;
-}
-
-static void apple_connector_backlight_commit_work(struct work_struct *work)
-{
-	struct apple_connector *connector =
-		container_of(work, struct apple_connector, bl_commit_wq);
-	struct platform_device *pdev = READ_ONCE(connector->dcp);
-	int ret;
-
-	if (!pdev)
-		return;
-
-	do {
-		ret = dcp_backlight_update(platform_get_drvdata(pdev));
-	} while (ret == -EDEADLK);
-
-	/* update stays set, so the next swap carries the level anyway */
-	if (ret)
-		drm_dbg(connector->base.dev, "%s: backlight commit: %d\n",
-			connector->base.name, ret);
-}
-
-/* Never follow fbdev blanking: DRM owns the external display's power. */
-static bool dcp_ext_backlight_controls_device(struct backlight_device *bd,
-					      struct device *display_dev)
-{
-	return false;
-}
-
-static const struct backlight_ops dcp_ext_backlight_ops = {
-	.update_status = dcp_ext_backlight_update_status,
-	.controls_device = dcp_ext_backlight_controls_device,
-};
-
-static void apple_connector_backlight_register(struct apple_connector *connector)
-{
-	struct backlight_properties props = {
-		.type = BACKLIGHT_RAW,
-		.max_brightness = DCP_EXT_BL_MAX,
-		.brightness = connector->bl_level < 0 ? DCP_EXT_BL_MAX :
-							 connector->bl_level,
-	};
-	struct backlight_device *bd;
-	char name[32];
-
-	/*
-	 * Sorts after the integrated panel's apple-panel-bl in any locale:
-	 * userspace that takes the first backlight as the built-in screen's
-	 * (Omarchy's omarchy-hw-display) keeps the panel.
-	 */
-	snprintf(name, sizeof(name), "dcp-%s-bl", connector->base.name);
-	bd = backlight_device_register(name, connector->base.kdev, connector,
-				       &dcp_ext_backlight_ops, &props);
-	if (IS_ERR(bd)) {
-		drm_warn(connector->base.dev,
-			 "%s: failed to register backlight: %pe\n",
-			 connector->base.name, bd);
-		return;
-	}
-
-	connector->bl_dev = bd;
-}
-
-static void apple_connector_backlight_unregister(struct apple_connector *connector)
-{
-	backlight_device_unregister(connector->bl_dev);
-	connector->bl_dev = NULL;
-}
-
-static void apple_connector_backlight_sync_work(struct work_struct *work)
-{
-	apple_connector_backlight_sync(container_of(work, struct apple_connector,
-						    bl_sync_wq));
-}
-
-void apple_connector_backlight_init(struct apple_connector *connector)
-{
-	mutex_init(&connector->bl_lock);
-	INIT_WORK(&connector->bl_sync_wq, apple_connector_backlight_sync_work);
-	INIT_WORK(&connector->bl_commit_wq, apple_connector_backlight_commit_work);
-	connector->bl_level = -1;
-}
-
-/*
- * Register the backlight while a display that supports it is connected, and
- * drop it otherwise.  Called from the connector's hotplug work.
- */
-void apple_connector_backlight_sync(struct apple_connector *connector)
-{
-	struct platform_device *pdev;
-	bool want = false;
-
-	mutex_lock(&connector->bl_lock);
-
-	pdev = READ_ONCE(connector->dcp);
-	if (connector->bl_allowed && READ_ONCE(connector->connected) && pdev) {
-		struct apple_dcp *dcp = platform_get_drvdata(pdev);
-
-		want = READ_ONCE(dcp->ext_backlight);
-	}
-
-	if (want && !connector->bl_dev)
-		apple_connector_backlight_register(connector);
-	else if (!want && connector->bl_dev)
-		apple_connector_backlight_unregister(connector);
-
-	/* Attributes and HPD can arrive after the first swap on reconnect.
-	 * Replay a chosen level on the current pipeline, even on a static
-	 * desktop where userspace has no further commits to submit.
-	 */
-	if (want && READ_ONCE(connector->bl_level) >= 0) {
-		struct apple_dcp *dcp = platform_get_drvdata(pdev);
-
-		/* Publish the retained level before do_swap() consumes update. */
-		smp_store_release(&dcp->brightness.update, true);
-		schedule_work(&connector->bl_commit_wq);
-	}
-
-	mutex_unlock(&connector->bl_lock);
-}
-
-int apple_connector_backlight_late_register(struct apple_connector *connector)
-{
-	mutex_lock(&connector->bl_lock);
-	connector->bl_allowed = true;
-	mutex_unlock(&connector->bl_lock);
-
-	/* a display may have connected before the connector was registered */
-	apple_connector_backlight_sync(connector);
-
-	return 0;
-}
-
-void apple_connector_backlight_early_unregister(struct apple_connector *connector)
-{
-	mutex_lock(&connector->bl_lock);
-	connector->bl_allowed = false;
-	if (connector->bl_dev)
-		apple_connector_backlight_unregister(connector);
-	mutex_unlock(&connector->bl_lock);
-	/* nothing can queue it again once the device is gone */
-	cancel_work_sync(&connector->bl_commit_wq);
 }

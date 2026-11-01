@@ -37,16 +37,7 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   u32 iomfb_surf,
 				   bool supports_l10r,
 				   bool supports_xrgb2101010,
-				   enum drm_plane_type type,
-				   bool interchange,
-				   bool premultiplied);
-struct drm_plane *apple_plane_init_v14_7(struct drm_device *dev,
-					 unsigned long possible_crtcs,
-					 u32 iomfb_surf,
-					 enum drm_plane_type type);
-
-/* T8132 internal panel: the qualified single-surface firmware profile. */
-struct drm_plane *apple_plane_init_v26_6(struct drm_device *dev,
-				      unsigned long possible_crtcs, u32 iomfb_surf);
+				   bool xrgb_is_alpha,
+				   enum drm_plane_type type);
 
 #endif /* __APPLE_PLANE_H__ */

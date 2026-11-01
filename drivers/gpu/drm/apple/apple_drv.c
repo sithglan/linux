@@ -13,19 +13,16 @@
 #include <linux/dma-mapping.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
-#include <linux/mutex.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
 #include <linux/soc/apple/dp-tunnel.h>
-#include <linux/soc/apple/display.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_blend.h>
 #include <drm/clients/drm_client_setup.h>
-#include <drm/drm_color_mgmt.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_helper.h>
@@ -43,11 +40,8 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
 
-#include "apple_boot_display.h"
-#include "apple_resume.h"
 #include "dcp.h"
 #include "plane.h"
-#include "iomfb_m4.h"
 
 #define DRIVER_NAME     "apple"
 #define DRIVER_DESC     "Apple display controller DRM driver"
@@ -56,61 +50,7 @@
 
 struct apple_drm_private {
 	struct drm_device drm;
-	/*
-	 * A T6041 panel refused the takeover trial: the boot framebuffer keeps
-	 * the screen, the DRM device stays unregistered and its DCPs running.
-	 */
-	bool aborted;
 };
-
-/* Component readiness is later than platform probe/bind. */
-static DEFINE_MUTEX(apple_t6030_display_lock);
-static struct device *apple_t6030_display;
-
-static int apple_t6030_display_publish(struct device *dev)
-{
-	if (!of_device_is_compatible(dev->of_node, "apple,t6030-display-subsystem"))
-		return 0;
-	guard(mutex)(&apple_t6030_display_lock);
-	if (apple_t6030_display)
-		return apple_t6030_display == dev ? 0 : -EBUSY;
-	apple_t6030_display = get_device(dev);
-	return 0;
-}
-
-static void apple_t6030_display_withdraw(struct device *dev)
-{
-	struct device *old = NULL;
-
-	scoped_guard(mutex, &apple_t6030_display_lock) {
-		if (apple_t6030_display == dev) {
-			old = apple_t6030_display;
-			apple_t6030_display = NULL;
-		}
-	}
-	put_device(old);
-}
-
-/* Initial G15 firmware startup must follow successful native display setup.
- * The component's device lock does not serialize component bind/unbind, so
- * publish separately. This lock protects only publication and a device link;
- * no display calls or firmware RPC run while it is held.
- */
-int apple_drm_t6030_link_device(struct device *consumer)
-{
-	struct device_link *link;
-
-	if (!of_machine_is_compatible("apple,t6030") || !consumer->of_node ||
-	    !of_device_is_compatible(consumer->of_node, "apple,agx-t6030"))
-		return -ENODEV;
-	guard(mutex)(&apple_t6030_display_lock);
-	if (!apple_t6030_display)
-		return -EPROBE_DEFER;
-	link = device_link_add(consumer, apple_t6030_display,
-			       DL_FLAG_AUTOREMOVE_CONSUMER);
-	return link ? 0 : -EINVAL;
-}
-EXPORT_SYMBOL_GPL(apple_drm_t6030_link_device);
 
 DEFINE_DRM_GEM_DMA_FOPS(apple_fops);
 
@@ -136,9 +76,12 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		struct apple_dcp *dcp;
 
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
-		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
-			/* H17P applies the stored fourth byte as straight alpha. */
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+			/*
+			 * H17P applies the stored fourth byte as straight alpha,
+			 * the H17G profile (M5) too: an XRGB console with X = 0
+			 * stays black. ARGB makes fbcon write it opaque.
+			 */
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
 			break;
@@ -176,17 +119,13 @@ static const struct drm_driver apple_drm_driver = {
 	.fops			= &apple_fops,
 };
 
-enum drm_connector_status
+static enum drm_connector_status
 apple_connector_detect(struct drm_connector *connector, bool force)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 
-	if (connector->force == DRM_FORCE_ON || connector->force == DRM_FORCE_ON_DIGITAL)
-		return connector_status_connected;
-	if (connector->force == DRM_FORCE_OFF)
-		return connector_status_disconnected;
-	return dcp_connector_connected(apple_connector) ?
-		connector_status_connected : connector_status_disconnected;
+	return apple_connector->connected ? connector_status_connected :
+						  connector_status_disconnected;
 }
 
 static void apple_connector_oob_hotplug(struct drm_connector *connector,
@@ -205,132 +144,55 @@ static void apple_connector_oob_hotplug(struct drm_connector *connector,
 			":0x%x in oob_hotplug event\n", (u32)status);
 }
 
-/* The fabric hold is optional at link time, see dcp.h. */
-static int apple_drm_fabric_hold(void)
-{
-	typeof(&apple_pmgr_fabric_hold) hold = symbol_get(apple_pmgr_fabric_hold);
-	int ret;
-
-	if (!hold)
-		return 0;
-	ret = hold();
-	symbol_put(apple_pmgr_fabric_hold);
-	return ret;
-}
-
-static void apple_drm_fabric_release(void)
-{
-	typeof(&apple_pmgr_fabric_release) release =
-		symbol_get(apple_pmgr_fabric_release);
-
-	if (!release)
-		return;
-	release();
-	symbol_put(apple_pmgr_fabric_release);
-}
-
 static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
-				     struct drm_atomic_commit *commit)
+				     struct drm_atomic_commit *state)
 {
-	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
-	struct apple_dcp *dcp = platform_get_drvdata(apple_crtc->dcp);
 	struct drm_crtc_state *crtc_state;
-	bool locked;
-	int ret;
+	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
-	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
-	locked = false;
-	ret = to_apple_atomic_state(commit)->failed_routes & drm_crtc_mask(crtc) ?
-		-EIO : dcp_typec_follow_crtc(crtc, commit, &locked);
-	/* A failed move must never power or program another sink's pipeline. */
-	if (ret || !dcp_crtc_route_ready(crtc, commit, false))
-		goto failed;
-
-	if (crtc_state->active && dcp_crtc_needs_route_start(dcp)) {
-		/* Establish the link/catalog before powering the assigned IOMFB. */
-		ret = dcp_typec_prepare_route(dcp);
-		if (ret)
-			goto failed;
-	}
-	if (crtc_state->active && !dcp_crtc_route_ready(crtc, commit, true))
-		goto failed;
-	if (crtc_state->active && !dcp->main_display && !apple_crtc->fabric_held) {
-		/* Raise the fabric before external scanout starts. */
-		if (apple_drm_fabric_hold())
-			dev_warn(dcp->dev, "fabric raise not confirmed before scanout\n");
-		apple_crtc->fabric_held = true;
-	}
-	if (crtc_state->active &&
-	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
+	if (crtc_state->active_changed && crtc_state->active) {
+		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 		dcp_poweron(apple_crtc->dcp);
+		/* Force the CTM to be set on first swap */
 		crtc_state->color_mgmt_changed = true;
-	} else if (crtc_state->active && drm_atomic_crtc_needs_modeset(crtc_state)) {
-		/* A cable generation can change while the CRTC stays active. */
-		dcp_external_recover(to_apple_crtc(crtc)->dcp);
 	}
-	if (crtc_state->active) {
-		ret = dcp_crtc_atomic_modeset(crtc, commit);
-		if (ret)
-			dcp_drm_crtc_error(apple_crtc, crtc_state, ret);
-	}
-	dcp_typec_follow_done(locked);
-	return;
 
-failed:
-	if (!ret)
-		ret = -EAGAIN;
-	dcp_mode_invalidate(&dcp->mode_state);
-	dev_err(dcp->dev, "CRTC route unavailable (%d); modeset deferred\n", ret);
-	/* Flush completes any pending flip without issuing a firmware swap. */
-	schedule_work(&dcp->vblank_wq);
-	if (dcp->connector)
-		dcp_route_failure_notify(dcp->connector);
-	dcp_typec_follow_done(locked);
+	if (crtc_state->active)
+		dcp_crtc_atomic_modeset(crtc, state);
 }
 
 static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
-				      struct drm_atomic_commit *commit)
+				      struct drm_atomic_commit *state)
 {
 	struct drm_crtc_state *crtc_state;
 	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 
-	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
+	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
 	if (crtc_state->active_changed && !crtc_state->active) {
 		dcp_poweroff(apple_crtc->dcp);
-		if (apple_crtc->fabric_held) {
-			apple_crtc->fabric_held = false;
-			apple_drm_fabric_release();
-		}
 	}
 
-	if (iomfb_is_m4(platform_get_drvdata(apple_crtc->dcp)) &&
-	    iomfb_m4_error(platform_get_drvdata(apple_crtc->dcp))) {
-		dcp_drm_crtc_error(apple_crtc, crtc_state, -EIO);
-		return;
-	}
-
-	if (crtc_state->event && !crtc_state->active) {
+	if (crtc->state->event && !crtc->state->active) {
 		spin_lock_irq(&crtc->dev->event_lock);
-		drm_crtc_send_vblank_event(crtc, crtc_state->event);
+		drm_crtc_send_vblank_event(crtc, crtc->state->event);
 		spin_unlock_irq(&crtc->dev->event_lock);
 
-		crtc_state->event = NULL;
+		crtc->state->event = NULL;
 	}
 }
 
 static void apple_crtc_atomic_begin(struct drm_crtc *crtc,
-				    struct drm_atomic_commit *commit)
+				    struct drm_atomic_commit *state)
 {
 	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
-	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(commit, crtc);
 	unsigned long flags;
 
-	if (new->event) {
+	if (crtc->state->event) {
 		spin_lock_irqsave(&crtc->dev->event_lock, flags);
-		apple_crtc->event = new->event;
+		apple_crtc->event = crtc->state->event;
 		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
-		new->event = NULL;
+		crtc->state->event = NULL;
 	}
 }
 
@@ -363,7 +225,7 @@ static int apple_crtc_set_crc_source(struct drm_crtc *crtc, const char *source)
 	int ret = apple_crtc_parse_crc_source(source, &enabled);
 
 	if (!ret)
-		ret = dcp_set_crc(crtc, enabled);
+		dcp_set_crc(crtc, enabled);
 
 	return ret;
 }
@@ -373,12 +235,6 @@ static int apple_crtc_verify_crc_source(struct drm_crtc *crtc,
 					size_t *values_cnt)
 {
 	bool enabled;
-	struct apple_dcp *dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-
-	if (iomfb_is_m4(dcp)) {
-		*values_cnt = 0;
-		return source ? -EOPNOTSUPP : 0;
-	}
 
 	if (apple_crtc_parse_crc_source(source, &enabled) < 0) {
 		pr_warn("dcp: Invalid CRC source name %s\n", source);
@@ -395,12 +251,6 @@ static const char * const apple_crtc_crc_sources[] = {"auto"};
 static const char *const * apple_crtc_get_crc_sources(struct drm_crtc *crtc,
 						      size_t *count)
 {
-	struct apple_dcp *dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-
-	if (iomfb_is_m4(dcp)) {
-		*count = 0;
-		return NULL;
-	}
 	*count = ARRAY_SIZE(apple_crtc_crc_sources);
 	return apple_crtc_crc_sources;
 }
@@ -418,38 +268,14 @@ static const struct drm_crtc_funcs apple_crtc_funcs = {
 
 };
 
-static struct drm_atomic_commit *apple_atomic_state_alloc(struct drm_device *dev)
-{
-	struct apple_atomic_state *state = kzalloc_obj(*state);
-
-	if (!state)
-		return NULL;
-	if (drm_atomic_commit_init(dev, &state->base)) {
-		kfree(state);
-		return NULL;
-	}
-	return &state->base;
-}
-
-static void apple_atomic_state_clear(struct drm_atomic_commit *state)
-{
-	drm_atomic_commit_default_clear(state);
-	to_apple_atomic_state(state)->failed_routes = 0;
-}
-
-static void apple_atomic_state_free(struct drm_atomic_commit *state)
-{
-	drm_atomic_commit_default_release(state);
-	kfree(to_apple_atomic_state(state));
-}
-
 static const struct drm_mode_config_funcs apple_mode_config_funcs = {
-	.atomic_state_alloc	= apple_atomic_state_alloc,
-	.atomic_state_clear	= apple_atomic_state_clear,
-	.atomic_state_free	= apple_atomic_state_free,
 	.atomic_check		= drm_atomic_helper_check,
 	.atomic_commit		= drm_atomic_helper_commit,
-	.fb_create		= drm_gem_fb_create,
+	/*
+	 * The DCP shows new content only with a swap: writes into a scanned out
+	 * buffer stay invisible. Commit damage (fbdev console, DIRTYFB) as one.
+	 */
+	.fb_create		= drm_gem_fb_create_with_dirty,
 };
 
 static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
@@ -481,27 +307,12 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 
-	/* Queued by the last disconnect at shutdown; they use the connector. */
-	cancel_work_sync(&apple_connector->hotplug_wq);
-	cancel_work_sync(&apple_connector->bl_sync_wq);
-	cancel_work_sync(&apple_connector->bl_commit_wq);
-	mutex_destroy(&apple_connector->bl_lock);
 	drm_connector_cleanup(connector);
 	kfree(apple_connector->color_elements.data);
 	kfree(apple_connector->timing_elements.data);
 	kfree(apple_connector->display_attributes.data);
 	kfree(apple_connector->transport.data);
 	kfree(apple_connector);
-}
-
-static int apple_connector_late_register(struct drm_connector *connector)
-{
-	return apple_connector_backlight_late_register(to_apple_connector(connector));
-}
-
-static void apple_connector_early_unregister(struct drm_connector *connector)
-{
-	apple_connector_backlight_early_unregister(to_apple_connector(connector));
 }
 
 static const struct drm_connector_funcs apple_connector_funcs = {
@@ -513,8 +324,6 @@ static const struct drm_connector_funcs apple_connector_funcs = {
 	.detect			= apple_connector_detect,
 	.debugfs_init		= apple_connector_debugfs_init,
 	.oob_hotplug_event	= apple_connector_oob_hotplug,
-	.late_register		= apple_connector_late_register,
-	.early_unregister	= apple_connector_early_unregister,
 };
 
 /*
@@ -531,18 +340,13 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 
 	/*
 	 * Type-C tunnels are routed before the modeset and cannot move here.
-	 * Reject stale topology and explicit assignments to another pipeline,
-	 * except for a direct route that follows its CRTC (12.3/13.5, see
-	 * dcp_typec_follow_crtc()): dcp_crtc_atomic_check() decides there.
+	 * Reject stale topology and explicit assignments to another pipeline.
 	 */
 	if (apple_connector->port_encoder) {
-		struct platform_device *pdev = READ_ONCE(apple_connector->dcp);
-
 		conn_state = drm_atomic_get_new_connector_state(state, conn);
-		if (!conn_state || !conn_state->crtc || !pdev)
-			return NULL;
-		if (pdev != to_apple_crtc(conn_state->crtc)->dcp &&
-		    !dcp_typec_follows_crtc(platform_get_drvdata(pdev)))
+		if (!conn_state || !conn_state->crtc ||
+		    READ_ONCE(apple_connector->dcp) !=
+		    to_apple_crtc(conn_state->crtc)->dcp)
 			return NULL;
 		return apple_connector->port_encoder;
 	}
@@ -553,66 +357,11 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 	return NULL;
 }
 
-/* The output color element follows the HDR metadata: a change is a modeset. */
-static int apple_connector_atomic_check(struct drm_connector *conn,
-					struct drm_atomic_commit *state)
-{
-	struct drm_connector_state *old = drm_atomic_get_old_connector_state(state, conn);
-	struct drm_connector_state *new = drm_atomic_get_new_connector_state(state, conn);
-	struct drm_crtc_state *crtc_state;
-
-	if (!new->crtc || (old->colorspace == new->colorspace &&
-			   drm_connector_atomic_hdr_metadata_equal(old, new)))
-		return 0;
-	crtc_state = drm_atomic_get_crtc_state(state, new->crtc);
-	if (IS_ERR(crtc_state))
-		return PTR_ERR(crtc_state);
-	crtc_state->mode_changed = true;
-	return 0;
-}
-
 static const struct drm_connector_helper_funcs apple_connector_helper_funcs = {
 	.get_modes		= dcp_get_modes,
 	.mode_valid		= dcp_mode_valid,
 	.atomic_best_encoder	= apple_connector_atomic_best_encoder,
-	.atomic_check		= apple_connector_atomic_check,
 };
-
-/*
- * External displays can take a PQ BT.2020 signal where the firmware
- * offers one, and a desktop 26.x panel PQ content it shows as EDR;
- * dcp_crtc_atomic_check() refuses it elsewhere.
- */
-static int apple_connector_attach_hdr(struct drm_connector *connector,
-				      bool panel_edr)
-{
-	const u32 colorspaces = BIT(DRM_MODE_COLORIMETRY_BT2020_RGB);
-	int ret;
-
-	switch (connector->connector_type) {
-	case DRM_MODE_CONNECTOR_eDP:
-		if (!panel_edr)
-			return 0;
-		fallthrough;
-	/* A desktop 26.x Type-C route is a pipeline output carrying DisplayPort. */
-	case DRM_MODE_CONNECTOR_USB:
-	case DRM_MODE_CONNECTOR_DisplayPort:
-		ret = drm_mode_create_dp_colorspace_property(connector, colorspaces);
-		break;
-	case DRM_MODE_CONNECTOR_HDMIA:
-		ret = drm_mode_create_hdmi_colorspace_property(connector, colorspaces);
-		break;
-	default:
-		return 0;
-	}
-	if (ret)
-		return ret;
-	ret = drm_connector_attach_colorspace_property(connector);
-	if (ret)
-		return ret;
-	drm_connector_attach_hdr_output_metadata_property(connector);
-	return 0;
-}
 
 static const struct drm_crtc_helper_funcs apple_crtc_helper_funcs = {
 	.atomic_begin		= apple_crtc_atomic_begin,
@@ -637,10 +386,6 @@ static int apple_connector_create(struct drm_device *drm,
 		return -ENOMEM;
 
 	mutex_init(&connector->chunk_lock);
-	apple_connector_edid_init(connector);
-	apple_connector_backlight_init(connector);
-	/* before anything can fail: cleanup cancels it */
-	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 	drm_connector_helper_add(&connector->base,
 				 &apple_connector_helper_funcs);
 	if (attach_fwnode)
@@ -653,14 +398,11 @@ static int apple_connector_create(struct drm_device *drm,
 	ret = drm_connector_attach_vrr_capable_property(&connector->base);
 	if (ret)
 		goto err_cleanup;
-	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_is_desktop(dcp));
-	if (ret)
-		goto err_cleanup;
 
 	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 	connector->connected = false;
-	apple_connector_set_pipeline(connector, dcp);
+	connector->dcp = dcp;
+	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 
 	ret = drm_connector_attach_encoder(&connector->base, &encoder->base);
 	if (ret)
@@ -690,7 +432,9 @@ static int apple_probe_per_dcp(struct device *dev,
 	struct apple_encoder *enc;
 	struct drm_plane *planes[DCP_MAX_PLANES];
 	unsigned long *iomfb_surfaces = dcp_get_iomfb_surfaces(dcp);
-	unsigned long top_surf = find_last_bit(iomfb_surfaces, DCP_MAX_PLANES);
+	const u32 *surface_order;
+	u32 surfs[DCP_MAX_PLANES];
+	u32 nr_surfs = 0, nr_order, i;
 	int ret;
 	int connector_type;
 	u32 surf;
@@ -698,62 +442,35 @@ static int apple_probe_per_dcp(struct device *dev,
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
 	struct apple_dcp *dcp_data = platform_get_drvdata(dcp);
 	bool supports_xrgb2101010;
-	bool supports_premultiplied;
 	enum drm_plane_type plane_type;
-	bool interchange;
-	bool supports_interchange;
 
 	supports_xrgb2101010 = dcp_data->fw_compat != DCP_FIRMWARE_H17P ||
 		dcp_data->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
-	/*
-	 * Interchange scanout has not been qualified with the H17P firmware
-	 * (T8140 and T8122): advertise linear framebuffers only there.
-	 */
-	supports_interchange = dcp_data->fw_compat != DCP_FIRMWARE_H17P;
-	/* The H17P swap surface has no is_premultiplied flag. */
-	supports_premultiplied = dcp_data->fw_compat != DCP_FIRMWARE_H17P;
 	if (bitmap_empty(iomfb_surfaces, DCP_MAX_PLANES))
 		return dev_err_probe(dev, -EINVAL, "No usable display surfaces\n");
 
-	if (dcp_fw_compat_is_14_7(dcp)) {
-		planes[0] = apple_plane_init_v14_7(drm, 1U << num, 0,
-						    DRM_PLANE_TYPE_PRIMARY);
-		if (IS_ERR(planes[0]))
-			return PTR_ERR(planes[0]);
-		ret = drm_plane_create_zpos_immutable_property(planes[0], 0);
-		if (ret)
-			return ret;
-		zpos = 1;
+	/*
+	 * Planes go to the IOMFB surfaces in ascending order, unless the DCP
+	 * carries an explicit surface order (see dcp_get_iomfb_surface_order()).
+	 */
+	surface_order = dcp_get_iomfb_surface_order(dcp, &nr_order);
+	if (nr_order) {
+		for (i = 0; i < nr_order && i < DCP_MAX_PLANES; i++)
+			surfs[nr_surfs++] = surface_order[i];
+	} else {
+		for_each_set_bit(surf, iomfb_surfaces, DCP_MAX_PLANES)
+			surfs[nr_surfs++] = surf;
 	}
 
-	/*
-	 * BUG:
-	 * Some DCPs support more than two surfaces. For some reason, these
-	 * will crash if the topmost layer is Interchange *and* the surface
-	 * is cleared *while content is being scanned out on the middle one*.
-	 * They do not do this with linear framebuffers, nor do they do this
-	 * when the middle surface is not in use. We therefore hide Interchange
-	 * from the surface.
-	 */
-	for_each_set_bit(surf, iomfb_surfaces, DCP_MAX_PLANES) {
-		if (dcp_fw_compat_is_14_7(dcp))
-			break;
+	for (i = 0; i < nr_surfs; i++) {
+		surf = surfs[i];
 		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
-		if (iomfb_is_m4(dcp_data)) {
-			if (zpos || surf)
-				return dev_err_probe(dev, -EINVAL,
-						     "T8132 panel needs surface 0 only\n");
-			planes[zpos] = apple_plane_init_v26_6(drm, 1U << num, surf);
-		} else {
-			interchange = supports_interchange &&
-				      (zpos <= 1 || surf != top_surf);
-
-			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
-							supports_l10r,
-							supports_xrgb2101010,
-							plane_type, interchange,
-							supports_premultiplied);
-		}
+		planes[zpos] = apple_plane_init(drm, 1U << num, surf,
+						supports_l10r,
+						supports_xrgb2101010,
+						dcp_data->hw.iomfb_method_profile ==
+							DCP_IOMFB_METHODS_H17G,
+						plane_type);
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
 
@@ -779,14 +496,7 @@ static int apple_probe_per_dcp(struct device *dev,
 		return ret;
 
 	drm_crtc_helper_add(&crtc->base, &apple_crtc_helper_funcs);
-	/* T8132 has no qualified CTM transaction. */
-	if (!iomfb_is_m4(dcp_data)) {
-		unsigned int gamma_size = dcp_gamma_lut_size(dcp);
-
-		drm_crtc_enable_color_mgmt(&crtc->base, 0, true, gamma_size);
-		if (gamma_size)
-			drm_mode_crtc_set_gamma_size(&crtc->base, gamma_size);
-	}
+	drm_crtc_enable_color_mgmt(&crtc->base, 0, true, 0);
 
 	crtc->dcp = dcp;
 	*crtc_mask = drm_crtc_mask(&crtc->base);
@@ -800,9 +510,7 @@ static int apple_probe_per_dcp(struct device *dev,
 	 * and no encoder either, because the port's encoder spans every
 	 * pipeline that can drive it.
 	 */
-	/* Desktop 26.x drives its Type-C route itself, as a pipeline output. */
-	if (connector_type == DRM_MODE_CONNECTOR_USB &&
-	    !dcp_fw_compat_is_desktop(dcp)) {
+	if (connector_type == DRM_MODE_CONNECTOR_USB) {
 		dcp_link(dcp, crtc, NULL);
 		*encoder = NULL;
 		return 0;
@@ -844,22 +552,11 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		bool secondary = idx >= nr_ports;
 		u32 mask = 0;
 
-		/* Only a failed T8122 dcpext could drive it: no connector. */
-		if (dcp_typec_port_unusable(port_idx)) {
-			drm_warn(drm, "Type-C port %u: its display pipeline is unusable\n",
-				 port_idx);
-			continue;
-		}
-
 		connector = kzalloc_obj(*connector);
 		if (!connector)
 			return -ENOMEM;
 
 		mutex_init(&connector->chunk_lock);
-		apple_connector_edid_init(connector);
-		apple_connector_backlight_init(connector);
-		/* before anything can fail: cleanup cancels it */
-		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 		drm_connector_helper_add(&connector->base,
 					 &apple_connector_helper_funcs);
 
@@ -874,13 +571,11 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		ret = drm_connector_attach_vrr_capable_property(&connector->base);
 		if (ret)
 			return ret;
-		ret = apple_connector_attach_hdr(&connector->base, false);
-		if (ret)
-			return ret;
 
 		connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 		connector->connected = false;
 		connector->dcp = NULL;
+		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
 
 		for (i = 0; i < num_dcp; i++) {
 			if (!dcp_typec_port_has_candidate(port_idx, dcp[i]))
@@ -890,13 +585,15 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 			 * lowest-indexed Type-C-only pipeline (dcpext1). Fix the
 			 * connector to it: compositors read possible_crtcs once
 			 * and would otherwise pair it with a pipeline the stream
-			 * can never be routed to. T6030 instead narrows both
-			 * connectors to the native processor holding their route.
+			 * can never be routed to.
 			 */
-			mask = dcp_fabric_port_crtc_mask(secondary,
-						       dcp_typec_ordered_dual_stream(),
-						       dcp_is_typec_only(dcp[i]),
-						       mask, crtc_mask[i]);
+			if (secondary) {
+				if (dcp_is_typec_only(dcp[i]) &&
+				    (!mask || crtc_mask[i] < mask))
+					mask = crtc_mask[i];
+				continue;
+			}
+			mask |= crtc_mask[i];
 		}
 
 		if (!mask) {
@@ -963,90 +660,25 @@ err:
 	return ret;
 }
 
-#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
-/*
- * The J713 loader describes the boot framebuffer only as a simple-framebuffer
- * node; its display subsystem has no "framebuffer" memory region.  Take the
- * aperture from the single available simple-framebuffer.
- */
-static bool apple_boot_fb_only(struct device *dev)
-{
-	return (of_device_is_compatible(dev->of_node, "apple,t8132-display-subsystem") ||
-		of_device_is_compatible(dev->of_node, "apple,t8132-display-diagnostics")) &&
-	       of_property_match_string(dev->of_node, "memory-region-names",
-					"framebuffer") < 0;
-}
-
-static int apple_get_boot_fb_resource(struct device *dev, struct resource *fb_r)
-{
-	struct device_node *np;
-	int found = 0, ret = -ENODEV;
-
-	for_each_compatible_node(np, NULL, "simple-framebuffer") {
-		if (!of_device_is_available(np))
-			continue;
-		if (++found > 1) {
-			of_node_put(np);
-			dev_err(dev, "more than one boot framebuffer\n");
-			return -EINVAL;
-		}
-		ret = of_address_to_resource(np, 0, fb_r);
-	}
-	if (ret)
-		dev_err(dev, "no boot framebuffer aperture: %d\n", ret);
-	return ret;
-}
-#endif
-
 static const struct of_device_id apple_dcp_id_tbl[] = {
 	{ .compatible = "apple,dcp" },
 	{ .compatible = "apple,dcpext" },
-	/* T6030: apple_dcp_usable() keeps its dcpext outside the DRM device. */
-	{ .compatible = "apple,t6030-dcp" },
-	{ .compatible = "apple,t8122-dcp" },
-	{ .compatible = "apple,t6031-dcp" },
-#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
-	{ .compatible = "apple,t8132-dcp" },
-#endif
 	{},
 };
 
 /*
- * A supported firmware-described external provider participates in component
- * matching. A T6030 external display processor is a pipe of this DRM device
- * once the display gate gave it its display DART; on the manual diagnostic
- * path it runs a separate session and never joins this DRM device.
+ * The T8140 external display coprocessor joins the display subsystem only
+ * when its node carries the Type-C display wiring it needs (see
+ * dcp_t8140_dcpext_wired()).  Otherwise leave it out, so that an enabled node
+ * cannot hold back the internal panel's component master.
  */
 static bool apple_dcp_usable(struct device_node *np)
 {
-	return of_device_is_available(np) &&
-	       (!of_device_is_compatible(np, "apple,t6030-dcpext") ||
-		dcp_t6030_ext_native(np)) &&
-	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
-		dcp_h17p_external_supported(np)) &&
-	       /* t6041_dcpext=0 keeps the T6041 external processors out. */
-	       (!of_device_is_compatible(np, "apple,t6041-dcpext") ||
-		dcp_t6041_ext_enabled());
-}
-
-static void apple_drm_quiesce_connectors(struct drm_device *drm)
-{
-	struct drm_connector_list_iter iter;
-	struct drm_connector *connector;
-
-	drm_connector_list_iter_begin(drm, &iter);
-	drm_for_each_connector_iter(connector, &iter) {
-		struct apple_connector *apple_connector = to_apple_connector(connector);
-
-		/* DCP callbacks can still enqueue these until component unbind
-		 * has drained RTKit. Stop their users before releasing endpoints,
-		 * clocks and IOMMUs, and reject enqueues during that release.
-		 */
-		disable_work_sync(&apple_connector->hotplug_wq);
-		disable_work_sync(&apple_connector->bl_sync_wq);
-		disable_work_sync(&apple_connector->bl_commit_wq);
-	}
-	drm_connector_list_iter_end(&iter);
+	if (!of_device_is_available(np))
+		return false;
+	if (of_device_is_compatible(np, "apple,t8140-dcpext"))
+		return dcp_t8140_dcpext_wired(np);
+	return true;
 }
 
 static int apple_drm_init_dcp(struct device *dev)
@@ -1055,9 +687,6 @@ static int apple_drm_init_dcp(struct device *dev)
 	struct platform_device *dcp[MAX_COPROCESSORS];
 	struct drm_encoder *encoder[MAX_COPROCESSORS];
 	u32 crtc_mask[MAX_COPROCESSORS] = {};
-	int connector_type[MAX_COPROCESSORS];
-	bool started[MAX_COPROCESSORS] = {};
-	bool ready[MAX_COPROCESSORS] = {};
 	struct device_node *np;
 	u64 timeout;
 	int i, ret, num_dcp = 0;
@@ -1067,40 +696,19 @@ static int apple_drm_init_dcp(struct device *dev)
 		if (!apple_dcp_usable(np))
 			continue;
 		dcp_ext = of_device_is_compatible(np, "apple,dcpext") ||
-		          of_device_is_compatible(np, "apple,t8140-dcpext") ||
 		          of_property_present(np, "phys");
-
-		/* component_bind_all() established the matched provider lifetime. */
-		if (of_device_is_compatible(np, "apple,t8140-dcpext") &&
-		    !dcp_h17p_external_ready(np)) {
-			of_node_put(np);
-			return -ENODEV;
-		}
 
 		dcp[num_dcp] = of_find_device_by_node(np);
 		if (!dcp[num_dcp])
 			continue;
-		/* A failed T8122 dcpext: bound, but no pipeline. */
-		if (dcp_ext_unusable(dcp[num_dcp])) {
-			dev_warn(dev, "%s: external display processor unusable, skipped\n",
-				 dev_name(&dcp[num_dcp]->dev));
-			put_device(&dcp[num_dcp]->dev);
-			continue;
-		}
 
 		device_link_add(dev, &dcp[num_dcp]->dev, DL_FLAG_AUTOREMOVE_SUPPLIER);
 
 		ret = apple_probe_per_dcp(dev, &apple->drm, dcp[num_dcp],
 					  num_dcp, dcp_ext, &encoder[num_dcp],
 					  &crtc_mask[num_dcp]);
-		if (ret) {
-			if (of_device_is_compatible(np, "apple,t8140-dcpext")) {
-				put_device(&dcp[num_dcp]->dev);
-				of_node_put(np);
-				return ret;
-			}
+		if (ret)
 			continue;
-		}
 
 		num_dcp++;
 	}
@@ -1118,59 +726,29 @@ static int apple_drm_init_dcp(struct device *dev)
 		return ret;
 
 	for (i = 0; i < num_dcp; i++) {
-		connector_type[i] = dcp_get_connector_type(dcp[i]);
 		ret = dcp_start(dcp[i]);
-		started[i] = !ret;
 		if (ret)
 			dev_warn(dev, "DCP[%d] failed to start: %d\n", i, ret);
 	}
 
 	/*
-	 * Starting DPTX might take some time.  The T6041 panel runs its
-	 * client-open, main-display and power chain inside the start: give it
-	 * as long as that takes.
+	 * Starting DPTX might take some time.
 	 */
 	timeout = get_jiffies_64() + msecs_to_jiffies(3000);
-	for (i = 0; i < num_dcp; i++)
-		if (of_device_is_compatible(dcp[i]->dev.of_node, "apple,t6041-dcp"))
-			timeout = get_jiffies_64() + msecs_to_jiffies(10000);
 
 	for (i = 0; i < num_dcp; ++i) {
 		u64 jiffies = get_jiffies_64();
 		u64 wait = time_after_eq64(jiffies, timeout) ?
 				   0 :
 				   timeout - jiffies;
-
-		/* A processor that did not start cannot become ready. */
-		if (!started[i])
-			continue;
 		ret = dcp_wait_ready(dcp[i], wait);
-		ready[i] = !ret;
-		/*
-		 * Any other processor that does not come up is left out: the
-		 * driver goes on without it.
+		/* There is nothing we can do if a dcp/dcpext does not boot
+		 * (successfully). Ignoring it should not do any harm now.
+		 * Needs to reevaluated when adding dcpext support.
 		 */
 		if (ret)
 			dev_warn(dev, "DCP[%d] not ready: %d\n", i, ret);
-		/*
-		 * The J713 panel is only taken over from a started session:
-		 * without it the boot framebuffer (simpledrm) stays.
-		 */
-		if (ret && iomfb_is_m4(platform_get_drvdata(dcp[i])))
-			return ret;
 	}
-
-	/*
-	 * The caller removes the boot framebuffer next. If none of the display
-	 * processors that can be showing it came up, that would leave the
-	 * screen black with nothing to replace it: fail instead, so that the
-	 * boot framebuffer stays.
-	 */
-	if (!apple_boot_display_up(connector_type, ready, num_dcp)) {
-		dev_err(dev, "no display processor that can show the boot framebuffer came up; keeping the boot framebuffer\n");
-		return -ENODEV;
-	}
-
 	/* HACK: Wait for dcp* to settle before a modeset */
 	msleep(100);
 
@@ -1181,21 +759,14 @@ static int apple_drm_init(struct device *dev)
 {
 	struct apple_drm_private *apple;
 	struct resource fb_r;
-	struct drm_crtc *crtc;
 	resource_size_t fb_size;
-	bool retained_modeset = false;
 	int ret;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (ret)
 		return ret;
 
-#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
-	if (apple_boot_fb_only(dev))
-		ret = apple_get_boot_fb_resource(dev, &fb_r);
-	else
-#endif
-		ret = apple_get_fb_resource(dev, "framebuffer", &fb_r);
+	ret = apple_get_fb_resource(dev, "framebuffer", &fb_r);
 	if (ret)
 		return ret;
 
@@ -1206,9 +777,13 @@ static int apple_drm_init(struct device *dev)
 
 	dev_set_drvdata(dev, apple);
 
-	ret = drmm_mode_config_init(&apple->drm);
+	ret = component_bind_all(dev, apple);
 	if (ret)
 		return ret;
+
+	ret = drmm_mode_config_init(&apple->drm);
+	if (ret)
+		goto err_unbind;
 
 	/*
 	 * IOMFB::UPPipeDCP_H13P::verify_surfaces produces the error "plane
@@ -1230,107 +805,33 @@ static int apple_drm_init(struct device *dev)
 	apple->drm.mode_config.funcs = &apple_mode_config_funcs;
 	apple->drm.mode_config.helper_private = &apple_mode_config_helpers;
 
-	ret = component_bind_all(dev, apple);
-	if (ret)
-		return ret;
-
 	ret = apple_drm_init_dcp(dev);
 	if (ret)
 		goto err_unbind;
 
 	drm_mode_config_reset(&apple->drm);
-	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)) {
-		drm_for_each_crtc(crtc, &apple->drm) {
-			if (iomfb_is_m4(platform_get_drvdata(to_apple_crtc(crtc)->dcp))) {
-				retained_modeset = true;
-				break;
-			}
-		}
-	}
 
-	/* Registration makes KMS visible before the first destructive T8132
-	 * swap. Hold the modeset locks across activation so an early userspace
-	 * commit cannot race the retained startup surface.
-	 */
-	/*
-	 * T6041 panel: everything that can still be refused is tried while
-	 * the boot framebuffer owns the screen; past the eviction there is no
-	 * way back.  On refusal leave the DCP running (its shutdown sequence
-	 * can crash it and blank the panel), pin the module and keep the boot
-	 * framebuffer.
-	 */
-	drm_for_each_crtc(crtc, &apple->drm) {
-		const char *reason = "none";
-
-		ret = dcp_takeover_trial(to_apple_crtc(crtc)->dcp, &reason);
-		if (!ret)
-			continue;
-		dev_err(dev, "display takeover refused (%s: %d); the boot framebuffer keeps the screen\n",
-			reason, ret);
-		/*
-		 * The DCPs keep running and keep their pipelines: pin the
-		 * module and the DRM device their CRTCs and connectors live
-		 * in, and keep them out of shutdown and sleep.
-		 */
-		__module_get(THIS_MODULE);
-		drm_dev_get(&apple->drm);
-		drm_for_each_crtc(crtc, &apple->drm)
-			dcp_takeover_aborted(to_apple_crtc(crtc)->dcp);
-		apple->aborted = true;
-		return 0;
-	}
-
-	if (retained_modeset)
-		drm_modeset_lock_all(&apple->drm);
 	fb_size = fb_r.end - fb_r.start + 1;
 	ret = aperture_remove_conflicting_devices(fb_r.start, fb_size,
 						  apple_drm_driver.name);
 	if (ret) {
 		dev_err(dev, "Failed remove fb: %d\n", ret);
-		goto err_unlock;
+		goto err_unbind;
 	}
 
 	ret = drm_dev_register(&apple->drm, 0);
 	if (ret)
-		goto err_unlock;
-	if (retained_modeset) {
-		drm_for_each_crtc(crtc, &apple->drm) {
-			ret = dcp_activate(to_apple_crtc(crtc)->dcp);
-			if (ret) {
-				drm_modeset_unlock_all(&apple->drm);
-				drm_dev_unregister(&apple->drm);
-				goto err_unbind;
-			}
-		}
-	}
-	if (retained_modeset)
-		drm_modeset_unlock_all(&apple->drm);
+		goto err_unbind;
 
 	/* the fabric keeps order only once registered: catch up on probe */
 	dcp_typec_reorder();
 
-	/* A panel that publishes no level registers its backlight now. */
-	drm_for_each_crtc(crtc, &apple->drm)
-		dcp_backlight_takeover_registered(to_apple_crtc(crtc)->dcp);
-
 	drm_client_setup_with_fourcc(&apple->drm, DRM_FORMAT_XRGB8888);
-
-	/* A subsequent successful platform probe retries deferred GPU probes. */
-	ret = apple_t6030_display_publish(dev);
-	if (ret) {
-		drm_dev_unregister(&apple->drm);
-		goto err_unbind;
-	}
 
 	return 0;
 
-err_unlock:
-	if (retained_modeset)
-		drm_modeset_unlock_all(&apple->drm);
 err_unbind:
-	apple_drm_quiesce_connectors(&apple->drm);
 	component_unbind_all(dev, NULL);
-	dcp_unlink(&apple->drm);
 	return ret;
 }
 
@@ -1338,19 +839,11 @@ static void apple_drm_uninit(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	apple_t6030_display_withdraw(dev);
-
-	/* An aborted takeover leaves its DCPs running until the reboot. */
-	if (apple->aborted)
-		return;
-
-	apple_drm_quiesce_connectors(&apple->drm);
 	drm_dev_unplug(&apple->drm);
 	drm_atomic_helper_shutdown(&apple->drm);
 
 	component_unbind_all(dev, NULL);
 
-	dcp_unlink(&apple->drm);
 	dev_set_drvdata(dev, NULL);
 }
 
@@ -1397,8 +890,7 @@ static int add_dcp_components(struct device *dev,
 				 * collection for the Apple display-subsystem so
 				 * ignore it here.
 				 */
-				if (of_device_is_compatible(port, "apple,t8103-atcphy") ||
-				    of_device_is_compatible(port, "apple,t8122-atcphy")) {
+				if (of_device_is_compatible(port, "apple,t8103-atcphy")) {
 					of_node_put(port);
 					continue;
 				}
@@ -1436,14 +928,6 @@ static void apple_platform_remove(struct platform_device *pdev)
 
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,display-subsystem" },
-	{ .compatible = "apple,t6030-display-subsystem" },
-	{ .compatible = "apple,t8122-display-subsystem" },
-	{ .compatible = "apple,t6031-display-subsystem" },
-#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
-	{ .compatible = "apple,t8132-display-subsystem" },
-	/* Accept the qualified handoff emitted by the existing boot loader. */
-	{ .compatible = "apple,t8132-display-diagnostics" },
-#endif
 	{}
 };
 MODULE_DEVICE_TABLE(of, of_match);
@@ -1453,44 +937,18 @@ static int apple_platform_suspend(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	if (apple && !apple->aborted)
+	if (apple)
 		return drm_mode_config_helper_suspend(&apple->drm);
 
 	return 0;
 }
 
-/*
- * The DCP of an external display sends the hotplug event for its CRTC
- * itself, once the modes of the new link are in; see dcp_hold_resume_event().
- * Returns false if any of @crtcs needs the event now.
- */
-static bool apple_drm_hold_resume_events(struct apple_drm_private *apple, u32 crtcs)
-{
-	struct drm_crtc *crtc;
-	bool held = true;
-
-	drm_for_each_crtc(crtc, &apple->drm) {
-		if (crtcs & drm_crtc_mask(crtc))
-			held &= dcp_hold_resume_event(to_apple_crtc(crtc)->dcp);
-	}
-	return held;
-}
-
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
-	u32 dropped = 0;
 
-	if (apple && !apple->aborted) {
-		if (apple->drm.mode_config.suspend_state)
-			dropped = apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
-		/* Have userspace set the mode of a CRTC resumed disabled again. */
-		if (dropped && apple_drm_hold_resume_events(apple, dropped))
-			dropped = 0;
+	if (apple)
 		drm_mode_config_helper_resume(&apple->drm);
-		if (dropped)
-			drm_kms_helper_hotplug_event(&apple->drm);
-	}
 
 	return 0;
 }
@@ -1514,34 +972,19 @@ static struct platform_driver apple_platform_driver = {
 };
 
 
+
 static int __init appledrm_register(void)
 {
-	int ret;
 	if (drm_firmware_drivers_only())
 		return -ENODEV;
 
-	/* A refused experimental profile keeps the boot framebuffer available. */
-	ret = apple_j613_25g83_coldplug();
-	if (ret)
-		pr_info("J613/25G83 display handoff refused: %d; keeping boot framebuffer\n", ret);
+#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
+	dcp_audio_register();
+#endif
+	dcp_register();
+	platform_driver_register(&apple_platform_driver);
 
-#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
-	ret = dcp_audio_register();
-	if (ret)
-		return ret;
-#endif
-	ret = dcp_register();
-	if (ret)
-		goto unregister_audio;
-	ret = platform_driver_register(&apple_platform_driver);
-	if (!ret)
-		return 0;
-	dcp_unregister();
-unregister_audio:
-#if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
-	dcp_audio_unregister();
-#endif
-	return ret;
+	return 0;
 }
 
 static void __exit appledrm_unregister(void)

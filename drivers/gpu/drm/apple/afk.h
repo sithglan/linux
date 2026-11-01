@@ -13,24 +13,18 @@
 #include <linux/spinlock.h>
 #include <linux/kconfig.h>
 #include <linux/math.h>
-#include <linux/mutex.h>
 #include <linux/types.h>
 
 #include "dcp.h"
 
 #define AFK_MAX_CHANNEL 16
 #define MAX_PENDING_CMDS 16
-#define AFKV2_INTERFACES BIT(16)
 
 struct apple_epic_service_ops;
 struct apple_dcp_afkep;
 
-void afk_service_retry(struct apple_dcp_afkep *ep);
-
 struct epic_cmd_info {
 	u16 tag;
-	u8 type;
-	size_t reply_length;
 
 	void *rxbuf;
 	void *txbuf;
@@ -38,9 +32,6 @@ struct epic_cmd_info {
 	dma_addr_t txbuf_dma;
 	size_t rxlen;
 	size_t txlen;
-	/* DMA allocation lengths above stay immutable until buffers are freed. */
-	size_t reply_len;
-	bool reply_len_valid;
 
 	u32 retcode;
 	bool done;
@@ -54,7 +45,6 @@ struct apple_epic_service {
 
 	struct epic_cmd_info cmds[MAX_PENDING_CMDS];
 	DECLARE_BITMAP(cmd_map, MAX_PENDING_CMDS);
-	/* Legacy EPIC sequence; AFKV2 history belongs to the interface. */
 	u8 cmd_tag;
 	spinlock_t lock;
 	/* Pins held by owners and synchronous callers; protected by lock. */
@@ -64,20 +54,16 @@ struct apple_epic_service {
 	bool enabled;
 	bool torndown;
 
-	/* Provider-owned prepare/init ticket; AFK core never interprets it. */
-	struct { u64 generation, epoch; } admission;
+	/*
+	 * H17P/AFKEP-V2 only (T8140 external DCP): a service must be
+	 * explicitly OPENed before the firmware accepts commands on it, and
+	 * every V2 packet carries a per-service sequence byte.  Unused on the
+	 * classic (V1) path.
+	 */
+	bool opened;
+	u8 seq;
+
 	void *cookie;
-
-	/* Admitted reannouncement waiting for the previous channel to drain. */
-	bool pending_open;
-	const char *pending_name, *pending_class;
-	s64 pending_unit;
-
-	/* Compact EPIC (desktop 26.x): the announced identity and OPEN state. */
-	char name[33];
-	s64 unit;
-	bool defer_start;
-	bool started;
 
     struct {
         struct dentry *entry;
@@ -91,25 +77,15 @@ struct apple_epic_service_ops {
 	const char name[32];
 	/* All retained pointers must be pinned before enabling slot reuse. */
 	bool reusable;
-	/* EOPNOTSUPP from prepare means intentional absence only for this role. */
-	bool optional;
 
-	/*
-	 * Optional admission, before OPEN/publication. Must not retain service
-	 * on failure; teardown must accept a failed/partial preparation.
-	 */
-	int (*prepare)(struct apple_epic_service *service, const char *name,
-		       const char *class, s64 unit);
-	/* Check the original prepare ticket before a deferred OPEN. */
-	int (*revalidate)(struct apple_epic_service *service, const char *name,
-			  const char *class, s64 unit);
 	void (*init)(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit);
+	/* Consumed synchronously before init publishes service readiness. */
+	void (*init_props)(struct apple_epic_service *service, s64 unit,
+			   const void *props, size_t size);
 	int (*call)(struct apple_epic_service *service, u32 idx,
 		    const void *data, size_t data_size, void *reply,
 		    size_t reply_size);
-	int (*call_v2)(struct apple_epic_service *service, u16 group, u32 command,
-		       const void *data, size_t size, void *reply, size_t room);
 	int (*report)(struct apple_epic_service *service, enum epic_subtype type,
 		      const void *data, size_t data_size);
 	void (*teardown)(struct apple_epic_service *service);
@@ -163,26 +139,6 @@ static inline void afk_service_put(struct apple_epic_service *service)
 	if (!WARN_ON(!service->users))
 		service->users--;
 	spin_unlock_irqrestore(&service->lock, flags);
-	afk_service_retry(service->ep);
-}
-
-/*
- * Take another pin on a service the caller already keeps pinned, e.g. an
- * owner pointer read under the owner's lock. Unlike afk_service_get() this
- * also succeeds after teardown, so a close can still be issued.
- */
-static inline struct apple_epic_service *afk_service_pin(struct apple_epic_service *service)
-{
-	unsigned long flags;
-
-	if (!service)
-		return NULL;
-
-	spin_lock_irqsave(&service->lock, flags);
-	service->users++;
-	spin_unlock_irqrestore(&service->lock, flags);
-
-	return service;
 }
 
 static inline void afk_service_disable(struct apple_epic_service *service)
@@ -191,17 +147,6 @@ static inline void afk_service_disable(struct apple_epic_service *service)
 
 	spin_lock_irqsave(&service->lock, flags);
 	service->enabled = false;
-	spin_unlock_irqrestore(&service->lock, flags);
-}
-
-/* Retire local ownership while keeping timed-out commands discoverable. */
-static inline void afk_service_retire(struct apple_epic_service *service)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&service->lock, flags);
-	service->enabled = false;
-	service->torndown = true;
 	spin_unlock_irqrestore(&service->lock, flags);
 }
 
@@ -218,22 +163,6 @@ static inline bool afk_service_matches(struct apple_epic_service *service,
 		 !bitmap_empty(service->cmd_map, MAX_PENDING_CMDS));
 	spin_unlock_irqrestore(&service->lock, flags);
 	return found;
-}
-
-/*
- * True if this slot last served @channel and was retired or discarded on our
- * side: the co-processor may still close that channel afterwards.
- */
-static inline bool afk_service_retired(struct apple_epic_service *service,
-				       u32 channel)
-{
-	unsigned long flags;
-	bool retired;
-
-	spin_lock_irqsave(&service->lock, flags);
-	retired = service->channel == channel && service->torndown;
-	spin_unlock_irqrestore(&service->lock, flags);
-	return retired;
 }
 
 /* The caller holds service->lock. */
@@ -256,40 +185,19 @@ afk_service_reinit(struct apple_epic_service *service,
 	spin_lock_irqsave(&service->lock, flags);
 	reusable = afk_service_reclaimable(service);
 	if (reusable) {
-		service->enabled = !ops->prepare;
+		service->enabled = true;
 		service->torndown = false;
 		service->ops = ops;
 		service->ep = ep;
 		service->channel = channel;
 		service->cookie = NULL;
-		/* Keep legacy slot history; AFKV2 history belongs to the interface. */
+		/* H17P/V2: a freshly (re-)announced service is not yet OPENed. */
+		service->opened = false;
+		service->seq = 0;
+		/* Keep the command-tag sequence across service generations. */
 	}
 	spin_unlock_irqrestore(&service->lock, flags);
 	return reusable;
-}
-
-/* Only used before a prepared service has been published to callers. */
-static inline void afk_service_discard(struct apple_epic_service *service)
-{
-	unsigned long flags;
-
-	if (service->ops->teardown)
-		service->ops->teardown(service);
-	spin_lock_irqsave(&service->lock, flags);
-	service->enabled = false;
-	service->torndown = true;
-	service->cookie = NULL;
-	service->ops = NULL;
-	spin_unlock_irqrestore(&service->lock, flags);
-}
-
-static inline void afk_service_publish(struct apple_epic_service *service)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&service->lock, flags);
-	service->enabled = true;
-	spin_unlock_irqrestore(&service->lock, flags);
 }
 
 struct afk_ringbuffer_header {
@@ -310,47 +218,6 @@ struct afk_qe {
 	__le32 type;
 	u8 data[];
 };
-
-static inline bool afk_ring_payload_fits(u32 ptr, u32 bytes, size_t bufsz)
-{
-	return ptr <= bufsz && sizeof(struct afk_qe) <= bufsz - ptr &&
-	       bytes <= bufsz - ptr - sizeof(struct afk_qe);
-}
-
-/*
- * Check the receive ring pointers before reading an entry. The consumer
- * only advances rptr in whole blocks of @stride bytes and stops when it
- * meets wptr, so the producer has to keep wptr block aligned and inside
- * the ring as well; wptr == bufsz is never written, it wraps to 0.
- */
-static inline bool afk_ring_ptrs_valid(u32 rptr, u32 wptr, size_t bufsz,
-				       u32 stride)
-{
-	return stride && bufsz >= sizeof(struct afk_qe) &&
-	       rptr <= bufsz - sizeof(struct afk_qe) && wptr < bufsz &&
-	       !(rptr % stride) && !(wptr % stride);
-}
-
-/*
- * One RECV notification drains at most as many entries as the ring has
- * blocks, so a producer that keeps moving wptr cannot hold the ordered
- * receive worker. Entries written after this pass come with their own
- * RECV notification.
- */
-static inline unsigned int afk_ring_drain_budget(size_t bufsz, u32 stride)
-{
-	return stride ? bufsz / stride : 1;
-}
-
-static inline unsigned int afk_ring_drain(bool (*recv)(void *ctx), void *ctx,
-					  unsigned int budget)
-{
-	unsigned int n = 0;
-
-	while (n < budget && recv(ctx))
-		n++;
-	return n;
-}
 
 struct epic_hdr {
 	u8 version;
@@ -385,35 +252,6 @@ struct epic_sub_hdr_h17p {
 } __packed;
 
 #define EPIC_SUBTYPE_ANNOUNCE_H17P 0x11
-
-/*
- * Compact EPIC, as the desktop 26.x firmware (T6041) speaks it on its
- * auxiliary endpoints: an 8-byte transport header, the 8-byte timestamp,
- * an 8-byte sub-header and, for commands and replies, a status/length
- * descriptor.  Ring entries carry channel and type 0.
- */
-struct epic_compact_hdr {
-	u8 seq;
-	u8 flags;
-	__le16 intf_id;
-	__le32 length;
-	__le64 timestamp;
-} __packed;
-
-struct epic_compact_sub_hdr {
-	u8 type;
-	u8 category;
-	u8 unk;
-	u8 flags;
-	__le32 reserved;
-} __packed;
-
-struct epic_compact_desc {
-	__le32 status;
-	__le32 length;
-} __packed;
-
-#include "afk-fragment.h"
 
 struct epic_cmd {
 	__le32 retcode;
@@ -456,6 +294,43 @@ enum epic_subtype {
 	EPIC_SUBTYPE_STD_SERVICE = 0xc0,
 };
 
+/*
+ * H17P / AFKEP-V2 command transport, used on the DisplayPort endpoints of the
+ * T8140 external DCP (apple_dcp_hw_data.h17p_external).
+ *
+ * The publication and report *decode* is shared with the classic path:
+ * struct epic_sub_hdr_h17p above is, byte for byte, the V2 common header
+ * (interface id at +2, type at +16, category at +17, report flags at +18).
+ * What the classic path cannot do is the command/response exchange, which
+ * uses a different envelope and inline (non-DMA) payloads.  A V2 packet on
+ * the wire is:
+ *
+ *   [0]      sequence byte (per service)
+ *   [2..3]   interface id (LE16)            == apple_epic_service.channel
+ *   [4..7]   following length (LE32)        == total bytes - 8
+ *   [8..15]  identifier (LE64, 0 for AP-originated commands)
+ *   [16]     type   (0x11 publish, 0x12 open, 0x13 close, 0xc0 command)
+ *   [17]     category (0 report, 1 command, 2 response)
+ *   [18]     report flag (open/close reports set 1)
+ *   [24]     command flags (bit0 = out-of-band buffers; we only do inline)
+ *   [25]     tag (matches a response to its command)
+ *   [28..31] capacity (command) or status (response), LE32
+ *   [32..95] struct epic_service_call (group@2, command@4, data_len@8, magic@12)
+ *   [96..]   inline service payload
+ */
+#define EPIC_V2_TYPE_PUBLISH		0x11
+#define EPIC_V2_TYPE_OPEN		0x12
+#define EPIC_V2_TYPE_CLOSE		0x13
+#define EPIC_V2_TYPE_COMMAND		0xc0
+#define EPIC_V2_CAT_REPORT		0
+#define EPIC_V2_CAT_COMMAND		1
+#define EPIC_V2_CAT_RESPONSE		2
+#define EPIC_V2_STATUS_UNSUPPORTED	0xe00002c7	/* kIOReturnUnsupported */
+#define EPIC_V2_REPORT_HDR		24	/* transport(8) + common(16) */
+#define EPIC_V2_HDR			32	/* + command/response(8) */
+#define EPIC_V2_CALL			64	/* struct epic_service_call */
+#define EPIC_V2_BODY			(EPIC_V2_HDR + EPIC_V2_CALL) /* = 96 */
+
 struct afk_ringbuffer {
 	bool ready;
 	__le32 *rptr;
@@ -470,14 +345,7 @@ struct apple_dcp_afkep {
 	struct apple_dcp *dcp;
 
 	u32 endpoint;
-	/* Set before afk_start; protocol selection is per endpoint. */
-	bool wire_v2;
-	/* External H17P DPAV only; other endpoints retain owned-DMA commands. */
-	bool inline_v2;
-	/* Fixed 16-bit interface domain; survives slot and channel reuse. */
-	u8 *command_tags;
 	struct workqueue_struct *wq;
-	struct work_struct service_work;
 
 	struct completion started;
 	struct completion stopped;
@@ -496,18 +364,6 @@ struct apple_dcp_afkep {
 	u16 qe_seq;
 	bool stopping; /* lock: no new receive work after shutdown. */
 
-	/* Compact EPIC, detected from the first compact message (desktop 26.x). */
-	bool compact;
-	struct list_head compact_cmds;	/* lock */
-	bool compact_shutting_down;	/* lock */
-	/* A message went out in part; no further sends (lock). */
-	bool compact_tx_desync;
-	/* Replies to firmware calls, see afk_compact_reply_worker(). */
-	struct workqueue_struct *tx_wq;
-	struct mutex compact_tx_lock;
-	struct afk_fragment_state compact_rx;
-	void *compact_rx_data;
-
 	const struct apple_epic_service_ops *ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
 	u32 num_channels;
@@ -519,11 +375,7 @@ struct apple_dcp_afkep {
 
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);
-int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
-		      void *buffer, size_t size, bool to_peer);
 int afk_start(struct apple_dcp_afkep *ep);
-int afk_start_service(struct apple_epic_service *service);
-void afk_cancel_commands(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);
@@ -544,27 +396,4 @@ int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
 			     u32 command, const void *data, size_t data_len,
 			     size_t data_pad, void *output, size_t output_len,
 			     size_t output_pad, unsigned int timeout_ms);
-int afk_service_call_len(struct apple_epic_service *service, u16 group,
-			 u32 command, const void *data, size_t data_len,
-			 size_t data_pad, void *output, size_t output_len,
-			 size_t output_pad, size_t *received);
-/*
- * As afk_service_call_timeout(), but the length the reply declares is checked
- * against what arrived and against @output_len + @output_pad, and @received
- * is set to the number of bytes of @output that the reply filled.
- */
-int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
-				 u32 command, const void *data, size_t data_len,
-				 size_t data_pad, void *output, size_t output_len,
-				 size_t output_pad, unsigned int timeout_ms,
-				 size_t *received);
-
-/* Strict variants return only firmware-reported bytes; legacy callers unchanged. */
-int afk_send_command_with_reply_len(struct apple_epic_service *service, u8 type,
-		const void *payload, size_t payload_len, void *output,
-		size_t output_len, u32 *retcode, size_t *reply_len);
-int afk_service_call_with_reply_len(struct apple_epic_service *service,
-		u16 group, u32 command, const void *data, size_t data_len,
-		size_t data_pad, void *output, size_t output_len,
-		size_t output_pad, size_t *reply_len);
 #endif

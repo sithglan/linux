@@ -24,11 +24,8 @@ struct DCP_FW_NAME(dcp_swap) {
 
 	u64 flags1;
 	u64 flags2;
-#if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
-	u8 unk_v14_7[0x48];
-#endif
 
-#if DCP_FW_H17(DCP_FW_VER)
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
 	 * H17P inserts 0x48 bytes between flags2 and the swap ID, which moves
 	 * to +0x98.  Every following field shifts with it: surf_ids +0x9c,
@@ -50,75 +47,24 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 swap_completed;
 
 	u32 bg_color;
-	u8 unk_110[0x30];
-	u32 active_region_en[SWAP_SURFACES];
-	struct dcp_rect active_regions[SWAP_SURFACES];
-	u8 unk_190[0x138];
+	u8 unk_110[0x1b8];
 	u32 unk_2c8;
-#if !DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 	u8 unk_2cc[0x14];
-#else
-	u8 unk_2cc[0x40];
-#endif
-#if !DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 	u32 unk_2e0;
-#else
-	u32 bl_update;
-#endif
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
-	/*
-	 * The desktop 26.x firmware takes the panel level in nits, as an
-	 * IEEE-754 binary64 at +0x35e (unaligned), flagged by bl_flags[1].
-	 * The display EDR scale (SDR white over the current peak) is the
-	 * binary64 at +0x37e, flagged by bl_flags[2]; the headroom the frame
-	 * uses is the one at +0x3e6, flagged by bl_flags[4].
-	 */
-	u8 bl_flags[6];
-	__le64 bl_nits;
-	u8 unk_366[0x18];
-	__le64 edr_scale;
-	u8 unk_386[0xb];
-#else
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)
 	u16 unk_2e2;
 #else
 	u8 unk_2e2[3];
 #endif
-#if !DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 	u64 bl_unk;
-#else
-	u32 bl_unk;
-#endif
 	u32 bl_value; // min value is 0x10000000
 	u8  bl_power; // constant 0x40 for on
 	u8 unk_2f3[0x2d];
-#endif
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
-	u8 unk_391[0x55];
-	__le64 edr_headroom;
-	u8 unk_3ee[0xe2];
-#elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	u8 unk_320[0x13f];
-#endif
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-#if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
-	u8 unk_14_7_2[0x30];
+	u8 unk_320[0x13f];
+	u64 unk_1;
 #endif
-	u32 unk_flags;
-	u32 unk_flags2;
-#endif
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
-	/*
-	 * Appended to the 14.7 record.  The firmware expects both flags set
-	 * on every visible swap; the other bytes are zero.
-	 */
-	u8 unk_26_6[0x16];
-	u8 presents_surface;
-	u8 unk_26_6_17[0x51];
-	u8 has_completion;
-	u8 unk_26_6_69[0x17];
-#endif
-#if DCP_FW_H17(DCP_FW_VER)
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
 	 * The H17P A408 request is 0xe9c bytes; with a 0x22c-byte surface,
 	 * SWAP_SURFACES = 4 and no surf2 block, that leaves this tail.
@@ -139,13 +85,6 @@ struct DCP_FW_NAME(dcp_surface) {
 
 /* Prototypes */
 
-/* The desktop 26.x request carries one more surf2 entry. */
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
-#define DCP_FW_SURF2_COUNT	6
-#else
-#define DCP_FW_SURF2_COUNT	5
-#endif
-
 struct DCP_FW_NAME(dcp_swap_submit_req) {
 	struct DCP_FW_NAME(dcp_swap) swap;
 	struct DCP_FW_NAME(dcp_surface) surf[SWAP_SURFACES];
@@ -156,9 +95,9 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	 * H17P carries no surf2 block: its trailing u8 null-flag run is 8 bytes
 	 * (swap_null + surf_null[4] + three tail bools).
 	 */
-#if !DCP_FW_H17(DCP_FW_VER)
-	struct DCP_FW_NAME(dcp_surface) surf2[DCP_FW_SURF2_COUNT];
-	u64 surf2_iova[DCP_FW_SURF2_COUNT];
+#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+	struct DCP_FW_NAME(dcp_surface) surf2[5];
+	u64 surf2_iova[5];
 #endif
 #endif
 	u8 unkbool;
@@ -171,14 +110,11 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u32 unkU32Ptr;
 #endif
-#if DCP_FW_LAYOUT_14_7(DCP_FW_VER) && !DCP_FW_DESKTOP_26(DCP_FW_VER)
-	u8 padding_14_7[0x234];
-#endif
 	u8 swap_null;
 	u8 surf_null[SWAP_SURFACES];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-#if !DCP_FW_H17(DCP_FW_VER)
-	u8 surf2_null[DCP_FW_SURF2_COUNT];
+#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+	u8 surf2_null[5];
 #endif
 #endif
 	u8 unkoutbool_null;
@@ -186,12 +122,10 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u8 unknown_pointer_null;
 	u8 unknown_output_null;
 #endif
-#if !DCP_FW_H17(DCP_FW_VER) && !DCP_FW_DESKTOP_26(DCP_FW_VER)
+#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
 	u8 padding[1];
 #endif
 } __packed;
-
-#undef DCP_FW_SURF2_COUNT
 
 struct DCP_FW_NAME(dcp_swap_submit_resp) {
 	u8 unkoutbool;
@@ -206,33 +140,9 @@ struct DCP_FW_NAME(dcp_swap_submit_resp) {
  * A406 swap_start / A473 set_power_state.  H17P shrank both requests: the
  * 0x10-byte struct dcp_iouserclient became a bare u64 handle and the
  * swap_start response no longer echoes it.  swap_start is 0x10 in / 0x8 out,
- * set_power_state 0x10 in.  The desktop 26.x firmware made the same
- * swap_start change; its set_power_state carries four transition flags.
+ * set_power_state 0x10 in.
  */
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
-struct DCP_FW_NAME(dcp_swap_start_req) {
-	u32 swap_id;
-	u64 client;			/* opaque client identity */
-	u8 swap_id_null;
-	u8 padding[3];
-} __packed;
-
-struct DCP_FW_NAME(dcp_swap_start_resp) {
-	u32 swap_id;
-	u32 ret;
-} __packed;
-
-struct DCP_FW_NAME(dcp_set_power_state_req) {
-	u64 unklong;			/* the power state */
-	u8 flags[4];			/* independent transition flags */
-	u8 result_null;
-	u8 padding[3];
-} __packed;
-
-static_assert(sizeof(struct DCP_FW_NAME(dcp_swap_start_req)) == 0x10);
-static_assert(sizeof(struct DCP_FW_NAME(dcp_swap_start_resp)) == 0x8);
-static_assert(sizeof(struct DCP_FW_NAME(dcp_set_power_state_req)) == 0x10);
-#elif DCP_FW_H17(DCP_FW_VER)
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 struct DCP_FW_NAME(dcp_swap_start_req) {
 	u32 swap_id;
 	u64 client;			/* IOUserClient kernel VA */
@@ -284,19 +194,11 @@ struct DCP_FW_NAME(dcp_set_power_state_req) {
  * u32 ret }.  With the old layout the DVA lands four bytes late and the
  * display engine DMAs to a bogus address.
  */
-#if DCP_FW_H17(DCP_FW_VER)
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 struct DCP_FW_NAME(dcp_map_buf_resp) {
 	u32 buffer;
 	u64 dva;
 	u32 unk;
-} __packed;
-static_assert(sizeof(struct DCP_FW_NAME(dcp_map_buf_resp)) == 0x10);
-#elif DCP_FW_DESKTOP_26(DCP_FW_VER)
-/* The desktop 26.x reply has the H17P layout, with a status. */
-struct DCP_FW_NAME(dcp_map_buf_resp) {
-	u32 buffer;
-	u64 dva;
-	u32 ret;
 } __packed;
 static_assert(sizeof(struct DCP_FW_NAME(dcp_map_buf_resp)) == 0x10);
 #else
@@ -309,12 +211,8 @@ struct DCP_FW_NAME(dcp_map_buf_resp) {
 
 struct DCP_FW_NAME(dc_swap_complete_resp) {
 	u32 swap_id;			/* +0x000 */
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
-	/* The desktop 26.x record is 0x730 bytes; the rest is not decoded. */
-	u8 opaque[0x72c];
-#else
 	u8 unkbool;			/* +0x004 */
-#if DCP_FW_H17(DCP_FW_VER)
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
 	 * H17P: swap_complete_ap_gated(u32, bool, SwapCompleteData const *,
 	 * SwapInfoBlob const *, u32, bool) is 0x730 bytes on the wire, 89 more
@@ -344,7 +242,6 @@ struct DCP_FW_NAME(dc_swap_complete_resp) {
 #endif
 	u32 unkint;
 	u8 swap_info_null;
-#endif
 #endif
 } __packed;
 
@@ -378,7 +275,7 @@ struct apple_dcp;
 
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state);
-void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *commit);
+void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, struct drm_atomic_commit *state);
 void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp);
 void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp);

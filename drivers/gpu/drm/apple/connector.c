@@ -15,40 +15,6 @@
 #include <drm/drm_managed.h>
 
 #include "dcp-internal.h"
-#include "iomfb_m4.h"
-
-void apple_connector_edid_init(struct apple_connector *connector)
-{
-	connector->edid_live = false;
-	connector->edid_invalidation_pending = false;
-}
-
-/*
- * The EDID cache is generation fenced and owned under mode_config.mutex:
- * mark it stale here, and the hotplug work or the next get_modes() clears it.
- */
-void apple_connector_invalidate_edid(struct apple_connector *connector)
-{
-	if (connector)
-		WRITE_ONCE(connector->edid_invalidation_pending, true);
-}
-
-void apple_connector_edid_set_live(struct apple_connector *connector, bool live)
-{
-	if (!connector)
-		return;
-	if (!live || READ_ONCE(connector->edid_live) != live)
-		apple_connector_invalidate_edid(connector);
-	WRITE_ONCE(connector->edid_live, live);
-}
-
-void apple_connector_set_pipeline(struct apple_connector *connector,
-				  struct platform_device *pdev)
-{
-	apple_connector_invalidate_edid(connector);
-	WRITE_ONCE(connector->edid_live, !!pdev);
-	WRITE_ONCE(connector->dcp, pdev);
-}
 
 enum dcp_chunk_type {
 	DCP_CHUNK_COLOR_ELEMENTS,
@@ -135,11 +101,6 @@ static void dcp_afk_debugfs_root(struct platform_device *pdev, int ep, struct de
 void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry *root)
 {
 	struct apple_connector *apple_con = to_apple_connector(connector);
-	struct apple_dcp *dcp = apple_con->dcp ?
-		platform_get_drvdata(apple_con->dcp) : NULL;
-
-	if (dcp && iomfb_is_m4(dcp))
-		iomfb_m4_debugfs_init(dcp, root);
 
         debugfs_create_file("ColorElements", 0444, root, apple_con,
                             &chunk_color_fops);
@@ -187,8 +148,6 @@ void dcp_connector_update_dict(struct apple_connector *connector, const char *ke
 		dcp_connector_set_dict(connector, &connector->display_attributes, chunks);
 	else if (!strcmp(key, "Transport"))
 		dcp_connector_set_dict(connector, &connector->transport, chunks);
-	else
-		kfree(chunks->data);
 
 	chunks->data = NULL;
 	chunks->length = 0;
