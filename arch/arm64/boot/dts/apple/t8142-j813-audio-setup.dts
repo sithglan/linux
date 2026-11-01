@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Test: the AOP as on T8140, with the setup port (ADT aop-exclave-mailbox,
+ * 0x5e067c000, IRQs 494/497, dart-aop stream 1).
+ */
+#include "t8142-j813-audio.dts"
+
+&{/soc} {
+	aop_setup_mbox: mailbox@5e067c000 {
+		compatible = "apple,t8140-aop-setup-mailbox";
+		reg = <0x5 0xe067c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 494 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 497 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		iommus = <&aop_dart 1>;
+		apple,dma-range = <0x200 0x0 0x10 0x0>;
+		#mbox-cells = <0>;
+	};
+};
+
+&aop {
+	compatible = "apple,t8142-aop", "apple,t8140-aop";
+	reg = <0x3 0x90c00000 0x0 0x1e0000>,
+	      <0x3 0x90600000 0x0 0x88000>;
+	mboxes = <&aop_mbox>, <&aop_setup_mbox>;
+	mbox-names = "mbox", "setup";
+};

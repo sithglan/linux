@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J813 SMC addresses/IRQs and CPU OPPs are from the retained Apple ADT.
+ * Sensor keys below were read on physical J813, September 13, 2026.
+ * Labels retain the firmware keys: per-core locations are not established.
+ * The SMC owns voltages. Linux requests firmware performance levels only.
+ */
+#include <dt-bindings/thermal/thermal.h>
+
+/ {
+	m5_e_opp: opp-table-e {
+		compatible = "operating-points-v2";
+		opp-shared;
+		opp-972000000 { opp-hz = /bits/ 64 <972000000>; opp-level = <1>; };
+		opp-1152000000 { opp-hz = /bits/ 64 <1152000000>; opp-level = <2>; };
+		opp-1584000000 { opp-hz = /bits/ 64 <1584000000>; opp-level = <3>; };
+		opp-1992000000 { opp-hz = /bits/ 64 <1992000000>; opp-level = <4>; };
+		opp-2352000000 { opp-hz = /bits/ 64 <2352000000>; opp-level = <5>; };
+		opp-2700000000 { opp-hz = /bits/ 64 <2700000000>; opp-level = <6>; };
+		opp-2964000000 { opp-hz = /bits/ 64 <2964000000>; opp-level = <7>; };
+		opp-3048000000 { opp-hz = /bits/ 64 <3048000000>; opp-level = <8>; };
+	};
+	m5_p_opp: opp-table-p {
+		compatible = "operating-points-v2";
+		opp-shared;
+		opp-1308000000 { opp-hz = /bits/ 64 <1308000000>; opp-level = <1>; };
+		opp-1608000000 { opp-hz = /bits/ 64 <1608000000>; opp-level = <2>; };
+		opp-1932000000 { opp-hz = /bits/ 64 <1932000000>; opp-level = <3>; };
+		opp-2220000000 { opp-hz = /bits/ 64 <2220000000>; opp-level = <4>; };
+		opp-2508000000 { opp-hz = /bits/ 64 <2508000000>; opp-level = <5>; };
+		opp-2820000000 { opp-hz = /bits/ 64 <2820000000>; opp-level = <6>; };
+		opp-3072000000 { opp-hz = /bits/ 64 <3072000000>; opp-level = <7>; };
+		opp-3300000000 { opp-hz = /bits/ 64 <3300000000>; opp-level = <8>; };
+		opp-3516000000 { opp-hz = /bits/ 64 <3516000000>; opp-level = <9>; };
+		opp-3720000000 { opp-hz = /bits/ 64 <3720000000>; opp-level = <10>; };
+		opp-3876000000 { opp-hz = /bits/ 64 <3876000000>; opp-level = <11>; };
+		opp-4020000000 { opp-hz = /bits/ 64 <4020000000>; opp-level = <12>; };
+		opp-4176000000 { opp-hz = /bits/ 64 <4176000000>; opp-level = <13>; };
+		opp-4248000000 { opp-hz = /bits/ 64 <4248000000>; opp-level = <14>; };
+		opp-4272000000 { opp-hz = /bits/ 64 <4272000000>; opp-level = <15>; };
+		opp-4332000000 { opp-hz = /bits/ 64 <4332000000>; opp-level = <16>; };
+		opp-4428000000 { opp-hz = /bits/ 64 <4428000000>; opp-level = <17>; };
+		opp-4416000000 { opp-hz = /bits/ 64 <4416000000>; opp-level = <18>; };
+		opp-4464000000 { opp-hz = /bits/ 64 <4464000000>; opp-level = <19>; };
+	};
+};
+
+&cpu0 {
+	operating-points-v2 = <&m5_e_opp>;
+	performance-domains = <&m5_e_cpufreq>;
+	#cooling-cells = <2>;
+};
+&cpu1 {
+	operating-points-v2 = <&m5_e_opp>;
+	performance-domains = <&m5_e_cpufreq>;
+	#cooling-cells = <2>;
+};
+&cpu2 {
+	operating-points-v2 = <&m5_e_opp>;
+	performance-domains = <&m5_e_cpufreq>;
+	#cooling-cells = <2>;
+};
+&cpu3 {
+	operating-points-v2 = <&m5_e_opp>;
+	performance-domains = <&m5_e_cpufreq>;
+	#cooling-cells = <2>;
+};
+&cpu4 {
+	operating-points-v2 = <&m5_e_opp>;
+	performance-domains = <&m5_e_cpufreq>;
+	#cooling-cells = <2>;
+};
+&cpu5 {
+	operating-points-v2 = <&m5_e_opp>;
+	performance-domains = <&m5_e_cpufreq>;
+	#cooling-cells = <2>;
+};
+&cpu6 {
+	operating-points-v2 = <&m5_p_opp>;
+	performance-domains = <&m5_p_cpufreq>;
+	#cooling-cells = <2>;
+};
+&cpu7 {
+	operating-points-v2 = <&m5_p_opp>;
+	performance-domains = <&m5_p_cpufreq>;
+	#cooling-cells = <2>;
+};
+&cpu8 {
+	operating-points-v2 = <&m5_p_opp>;
+	performance-domains = <&m5_p_cpufreq>;
+	#cooling-cells = <2>;
+};
+&cpu9 {
+	operating-points-v2 = <&m5_p_opp>;
+	performance-domains = <&m5_p_cpufreq>;
+	#cooling-cells = <2>;
+};
+
+&{/soc} {
+	m5_e_cpufreq: performance-controller@210e20000 {
+		compatible = "apple,t8142-cluster-cpufreq", "apple,cluster-cpufreq";
+		reg = <2 0x10e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+	m5_p_cpufreq: performance-controller@211e20000 {
+		compatible = "apple,t8142-cluster-cpufreq", "apple,cluster-cpufreq";
+		reg = <2 0x11e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+
+	m5_smc_mbox: mailbox@38c608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0x8c608000 0 0x4000>;
+		/* ADT order is send-not-empty, send-empty, recv-not-empty, recv-empty. */
+		interrupts = <AIC_IRQ 633 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 634 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 635 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 636 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	m5_smc: smc@38c600000 {
+		compatible = "apple,t8142-smc", "apple,t8103-smc";
+		reg = <3 0x8c600000 0 0x4000>, <3 0x8de00000 0 0x120000>;
+		reg-names = "smc", "sram";
+		mboxes = <&m5_smc_mbox>;
+
+		m5_smc_hwmon: hwmon {
+			compatible = "apple,smc-hwmon";
+			#thermal-sensor-cells = <1>;
+			temperature-TCHP { apple,key-id = "TCHP"; label = "SMC TCHP"; };
+			temperature-TCMb { apple,key-id = "TCMb"; label = "SMC TCMb"; };
+			temperature-Te04 { apple,key-id = "Te04"; label = "SMC Te04"; };
+			temperature-Te08 { apple,key-id = "Te08"; label = "SMC Te08"; };
+			temperature-Te0C { apple,key-id = "Te0C"; label = "SMC Te0C"; };
+			temperature-Te0R { apple,key-id = "Te0R"; label = "SMC Te0R"; };
+			temperature-Tp00 { apple,key-id = "Tp00"; label = "SMC Tp00"; };
+			temperature-Tp04 { apple,key-id = "Tp04"; label = "SMC Tp04"; };
+			temperature-Tp0C { apple,key-id = "Tp0C"; label = "SMC Tp0C"; };
+			temperature-Tp0G { apple,key-id = "Tp0G"; label = "SMC Tp0G"; };
+			temperature-Tp0O { apple,key-id = "Tp0O"; label = "SMC Tp0O"; };
+			temperature-Tp0R { apple,key-id = "Tp0R"; label = "SMC Tp0R"; };
+			temperature-Tp0X { apple,key-id = "Tp0X"; label = "SMC Tp0X"; };
+			temperature-Tp0a { apple,key-id = "Tp0a"; label = "SMC Tp0a"; };
+			temperature-Tp0p { apple,key-id = "Tp0p"; label = "SMC Tp0p"; };
+			temperature-Tp0u { apple,key-id = "Tp0u"; label = "SMC Tp0u"; };
+			temperature-Tp0y { apple,key-id = "Tp0y"; label = "SMC Tp0y"; };
+			temperature-Tp12 { apple,key-id = "Tp12"; label = "SMC Tp12"; };
+			temperature-Tp16 { apple,key-id = "Tp16"; label = "SMC Tp16"; };
+			temperature-Tp1E { apple,key-id = "Tp1E"; label = "SMC Tp1E"; };
+			temperature-Tg04 { apple,key-id = "Tg04"; label = "SMC Tg04"; };
+			temperature-Tg0C { apple,key-id = "Tg0C"; label = "SMC Tg0C"; };
+			temperature-Tg0G { apple,key-id = "Tg0G"; label = "SMC Tg0G"; };
+			temperature-Tg0K { apple,key-id = "Tg0K"; label = "SMC Tg0K"; };
+			temperature-Tg0O { apple,key-id = "Tg0O"; label = "SMC Tg0O"; };
+			temperature-Tg0R { apple,key-id = "Tg0R"; label = "SMC Tg0R"; };
+			temperature-Tg0U { apple,key-id = "Tg0U"; label = "SMC Tg0U"; };
+			temperature-Tg0X { apple,key-id = "Tg0X"; label = "SMC Tg0X"; };
+			temperature-Tg0d { apple,key-id = "Tg0d"; label = "SMC Tg0d"; };
+			temperature-Tg0g { apple,key-id = "Tg0g"; label = "SMC Tg0g"; };
+			temperature-Tg0j { apple,key-id = "Tg0j"; label = "SMC Tg0j"; };
+			temperature-Tg0m { apple,key-id = "Tg0m"; label = "SMC Tg0m"; };
+			temperature-Tg0p { apple,key-id = "Tg0p"; label = "SMC Tg0p"; };
+			temperature-Tg12 { apple,key-id = "Tg12"; label = "SMC Tg12"; };
+			temperature-Tg16 { apple,key-id = "Tg16"; label = "SMC Tg16"; };
+			temperature-Tg1A { apple,key-id = "Tg1A"; label = "SMC Tg1A"; };
+			temperature-Tg1I { apple,key-id = "Tg1I"; label = "SMC Tg1I"; };
+			temperature-Tg1M { apple,key-id = "Tg1M"; label = "SMC Tg1M"; };
+			temperature-Tg1Y { apple,key-id = "Tg1Y"; label = "SMC Tg1Y"; };
+			temperature-Tg1c { apple,key-id = "Tg1c"; label = "SMC Tg1c"; };
+			temperature-Tg1g { apple,key-id = "Tg1g"; label = "SMC Tg1g"; };
+			temperature-Tg1o { apple,key-id = "Tg1o"; label = "SMC Tg1o"; };
+			temperature-Tg1s { apple,key-id = "Tg1s"; label = "SMC Tg1s"; };
+		};
+	};
+};

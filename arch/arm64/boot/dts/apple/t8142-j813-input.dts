@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+#include "t8142-j813-wifi.dts"
+#include "t8142-j813-keyboard-backlight.dtsi"
+
+/* MTP resources checked against the live J813 ADT on 2026-09-10.
+ * This separate bring-up payload retains the qualified Wi-Fi-only DTB.
+ * The SRAM window is the iBoot firmware carveout verified by the J813
+ * m1n1 MTP handoff; ADT reg[1] is the control region, not that carveout.
+ */
+&{/soc} {
+	mtp: mtp@394600000 {
+		compatible = "apple,t8142-mtp", "apple,mtp", "apple,rtk-helper-asc4";
+		reg = <3 0x94600000 0 0x4000>,
+		      <3 0x94c00000 0 0x100000>;
+		reg-names = "asc", "sram";
+		mboxes = <&mtp_mbox>;
+		iommus = <&mtp_dart 0>;
+		#helper-cells = <0>;
+	};
+
+	mtp_mbox: mailbox@394608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0x94608000 0 0x4000>;
+		interrupts = <AIC_IRQ 1299 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1300 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1301 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1302 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	mtp_dart: iommu@394800000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <3 0x94800000 0 0xc000>;
+		interrupts = <AIC_IRQ 1275 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		/* Same 32 MiB..288 MiB IOVA pool as the proven J813 MTP handoff. */
+		apple,dma-range = <0 0x02000000 0 0x10000000>;
+	};
+
+	mtp_dockchannel: fifo@394b14000 {
+		compatible = "apple,t8142-dockchannel", "apple,dockchannel";
+		reg = <3 0x94b14000 0 0x1000>;
+		reg-names = "irq";
+		interrupts = <AIC_IRQ 1277 IRQ_TYPE_LEVEL_HIGH>;
+		ranges = <0 3 0x94b28000 0x20000>;
+		nonposted-mmio;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+
+		mtp_hid: input@8000 {
+			compatible = "apple,dockchannel-hid";
+			reg = <0x8000 0x1000>, <0xc000 0x1000>,
+			      <0x0000 0x1000>, <0x4000 0x1000>;
+			reg-names = "config", "data", "rmt-config", "rmt-data";
+			iommus = <&mtp_dart 0>;
+			interrupt-parent = <&mtp_dockchannel>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>, <3 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "tx", "rx";
+			apple,fifo-size = <0x800>;
+			apple,helper-cpu = <&mtp>;
+			/* STM supplies the real shared HID identity on J813. */
+			stm { };
+
+			multi-touch {
+				firmware-name = "apple/tpmtfw-j813.bin";
+				apple,power-method = <2>;
+			};
+
+			keyboard {
+				hid-country-code = <33>;
+				apple,keyboard-layout-id = <5>;
+			};
+		};
+	};
+};

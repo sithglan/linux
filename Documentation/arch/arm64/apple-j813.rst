@@ -179,7 +179,7 @@ separate checks below. The disabled Samsung UART node
 records its measured resources; the qualified console path is DockChannel.
 
 Temperature monitoring and built-in input
-=========================================
+========================================
 
 Temperature monitoring enumerates the running SMC's readable, non-function
 ``T`` keys with four-byte floating-point values. It exposes their identifiers
