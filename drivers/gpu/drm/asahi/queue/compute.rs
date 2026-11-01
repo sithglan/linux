@@ -37,7 +37,6 @@ impl super::QueueInner::ver {
     /// Submit work to a compute queue.
     pub(super) fn submit_compute(
         &self,
-        gpu: &gpu::GpuManager::ver,
         job: &mut Job<super::QueueJob::ver>,
         cmdbuf: &uapi::drm_asahi_cmd_compute,
         attachments: &microseq::Attachments,
@@ -45,6 +44,20 @@ impl super::QueueInner::ver {
         id: u64,
         flush_stamps: bool,
     ) -> Result {
+        let gpu = match (*self.dev)
+            .gpu
+            .legacy_manager()
+            .ok_or(EIO)?
+            .as_any()
+            .downcast_ref::<gpu::GpuManager::ver>()
+        {
+            Some(gpu) => gpu,
+            None => {
+                dev_crit!(self.dev.as_ref(), "GpuManager mismatched with Queue!\n");
+                return Err(EIO);
+            }
+        };
+
         let mut alloc = gpu.alloc();
         let kalloc = &mut *alloc;
 

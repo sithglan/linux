@@ -20,7 +20,6 @@ use crate::fw::channels::{
 };
 use crate::fw::types::*;
 use crate::fw::workqueue::*;
-use crate::module_parameters;
 use crate::no_debug;
 use crate::object::OpaqueGpuObject;
 use crate::{
@@ -95,43 +94,22 @@ impl From<WorkError> for kernel::error::Error {
     }
 }
 
-/// An object the firmware may still reference while its GPU context is live.
-pub(crate) type RetainedObject = KBox<dyn Any + Send>;
-
-/// Objects retained by every context: the notifier and the vertex, fragment and compute work
-/// queues of the owning queue.
-const CONTEXT_RETAINED_OBJECTS: usize = 4;
-
-/// A dropped GPU context waiting for the firmware to invalidate it.
-pub(crate) struct RetiredContext {
-    /// The context data named in the invalidation request.
-    pub(crate) data: KBox<GpuObject<fw::workqueue::GpuContextData>>,
-    /// Firmware structures of the context's queues. They must not be freed, and so must not be
-    /// reused, until the invalidation has completed.
-    pub(crate) retained: KVec<RetainedObject>,
-}
-
 /// A GPU context tracking structure, which must be explicitly invalidated when dropped.
-///
-/// The firmware learns about the work queues of a context as they are run, and only forgets them
-/// when the context is invalidated. Their firmware structures are therefore handed to the context
-/// when their owner drops them, and freed after the invalidation.
 pub(crate) struct GpuContext {
-    dev: driver::AsahiDevice,
+    dev: driver::AsahiDevRef,
     data: Option<KBox<GpuObject<fw::workqueue::GpuContextData>>>,
-    retained: Pin<KBox<Mutex<KVec<RetainedObject>>>>,
 }
 no_debug!(GpuContext);
 
 impl GpuContext {
     /// Allocate a new GPU context.
     pub(crate) fn new(
-        dev: driver::AsahiDevice,
+        dev: &driver::AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
         buffer: Arc<dyn core::any::Any + Send + Sync>,
     ) -> Result<GpuContext> {
         Ok(GpuContext {
-            dev,
+            dev: dev.into(),
             data: Some(KBox::new(
                 alloc.shared.new_object(
                     fw::workqueue::GpuContextData { _buffer: buffer },
@@ -139,44 +117,20 @@ impl GpuContext {
                 )?,
                 GFP_KERNEL,
             )?),
-            retained: KBox::pin_init(
-                new_mutex!(
-                    KVec::with_capacity(CONTEXT_RETAINED_OBJECTS, GFP_KERNEL)?,
-                    "GpuContext::retained"
-                ),
-                GFP_KERNEL,
-            )?,
         })
     }
 
-    /// Returns a weak GPU pointer to the inner GPU context data structure.
-    pub(crate) fn weak_pointer(&self) -> GpuWeakPointer<fw::workqueue::GpuContextData> {
-        self.data.as_ref().unwrap().weak_pointer()
-    }
-
-    /// Keep `object` allocated until the firmware has invalidated this context.
-    pub(crate) fn retain(&self, object: RetainedObject) -> Result {
-        self.retained.lock().push(object, GFP_KERNEL)?;
-        Ok(())
+    /// Returns the GPU pointer to the inner GPU context data structure.
+    pub(crate) fn gpu_pointer(&self) -> GpuPointer<'_, fw::workqueue::GpuContextData> {
+        self.data.as_ref().unwrap().gpu_pointer()
     }
 }
 
 impl Drop for GpuContext {
     fn drop(&mut self) {
+        mod_dev_dbg!(self.dev, "GpuContext: Freeing GPU context\n");
         let data = self.data.take().unwrap();
-        let retained = core::mem::take(&mut *self.retained.lock());
-
-        let Some(guard) = self.dev.registration_guard() else {
-            return;
-        };
-
-        guard.registration_data_with(|reg_data| {
-            // A context only exists for the manager whose allocators created it, so the manager is
-            // always present.
-            if let Some(gpu) = reg_data.gpu.manager() {
-                gpu.free_context(RetiredContext { data, retained });
-            }
-        })
+        (*self.dev).gpu.free_context(data);
     }
 }
 
@@ -271,12 +225,9 @@ impl<O: OpaqueCommandObject, C: FnOnce(Option<WorkError>) + Send + Sync> GenSubm
 /// Inner data for managing a single work queue.
 #[versions(AGX)]
 struct WorkQueueInner {
-    dev: driver::AsahiDevice,
+    dev: driver::AsahiDevRef,
     event_manager: Arc<event::EventManager>,
-    /// The firmware structures of this queue. Always `Some` until the queue is dropped, when they
-    /// move to `gpu_context`.
-    info: Option<KBox<GpuObject<QueueInfo::ver>>>,
-    gpu_context: Arc<GpuContext>,
+    info: GpuObject<QueueInfo::ver>,
     new: bool,
     pipe_type: PipeType,
     size: u32,
@@ -304,22 +255,10 @@ pub(crate) struct WorkQueue {
 
 #[versions(AGX)]
 impl WorkQueueInner::ver {
-    fn info(&self) -> &GpuObject<QueueInfo::ver> {
-        self.info
-            .as_deref()
-            .expect("WorkQueue: lost its queue info")
-    }
-
-    fn info_mut(&mut self) -> &mut GpuObject<QueueInfo::ver> {
-        self.info
-            .as_deref_mut()
-            .expect("WorkQueue: lost its queue info")
-    }
-
     /// Return the GPU done pointer, representing how many work items have been completed by the
     /// GPU.
     fn doneptr(&self) -> u32 {
-        self.info()
+        self.info
             .state
             .with(|raw, _inner| raw.gpu_doneptr.load(Ordering::Acquire))
     }
@@ -536,7 +475,7 @@ impl Job::ver {
 
             let next_wptr = (wptr + 1) % inner.size;
             assert!(inner.doneptr() != next_wptr);
-            inner.info_mut().ring[wptr as usize] = command.inner.gpu_va().get();
+            inner.info.ring[wptr as usize] = command.inner.gpu_va().get();
             wptr = next_wptr;
 
             // Cannot fail, since we did a reserve(1) above
@@ -566,7 +505,7 @@ impl<'a> JobSubmission::ver<'a> {
         core::mem::forget(self);
 
         inner
-            .info()
+            .info
             .state
             .with(|raw, _inner| raw.cpu_wptr.store(wptr, Ordering::Release));
 
@@ -578,7 +517,7 @@ impl<'a> JobSubmission::ver<'a> {
 
         let msg = fw::channels::RunWorkQueueMsg::ver {
             pipe_type: inner.pipe_type,
-            work_queue: Some(inner.info().weak_pointer()),
+            work_queue: Some(inner.info.weak_pointer()),
             wptr: inner.wptr,
             event_slot,
             is_new: inner.new,
@@ -669,23 +608,6 @@ impl<'a> Drop for JobSubmission::ver<'a> {
 }
 
 #[versions(AGX)]
-impl Drop for WorkQueueInner::ver {
-    fn drop(&mut self) {
-        // The firmware keeps referring to this queue until its context is invalidated. When the
-        // queue's owner went away with work in flight, the queue is dropped as soon as that work
-        // completes, which can be well before the invalidation.
-        if let Some(info) = self.info.take() {
-            if self.gpu_context.retain(info).is_err() {
-                pr_err!(
-                    "WorkQueue({:?}): Failed to keep the queue until its context is invalidated\n",
-                    self.pipe_type
-                );
-            }
-        }
-    }
-}
-
-#[versions(AGX)]
 impl WorkQueueInner::ver {
     /// Return the number of free entries in the workqueue
     pub(crate) fn free_space(&self) -> usize {
@@ -711,8 +633,7 @@ impl WorkQueue::ver {
     /// Create a new WorkQueue of a given type and priority.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        dev: driver::AsahiDevice,
-        cfg: &crate::hw::HwConfig,
+        dev: &driver::AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
         event_manager: Arc<event::EventManager>,
         gpu_context: Arc<GpuContext>,
@@ -727,86 +648,67 @@ impl WorkQueue::ver {
         let ring = alloc.shared.array_empty(size as usize)?;
         let mut prio = *raw::PRIORITY.get(priority as usize).ok_or(EINVAL)?;
 
-        #[ver(G == G14X)]
-        let preempt_auto = cfg.chip_id == 0x6021;
-        #[ver(G != G14X)]
-        let preempt_auto = {
-            let _ = cfg;
-            false
-        };
-        let preempt = match module_parameters::compute_preempt.value() {
-            -1 => preempt_auto || debug_enabled(DebugFlags::Debug0),
-            value => value != 0,
-        };
-
-        // Without preemption the compute queue takes priority fields 0 and 5 of the highest
-        // priority entry. The firmware then cannot switch compute work out when another client
-        // needs the GPU, and on G14X it kills the work when the context-switch and kill
-        // timeouts expire.
-        if pipe_type == PipeType::Compute && !preempt {
+        if pipe_type == PipeType::Compute && !debug_enabled(DebugFlags::Debug0) {
+            // Hack to disable compute preemption until we fix it
             prio.0 = 0;
             prio.5 = 1;
         }
 
-        let gpu_context_pointer = gpu_context.weak_pointer();
-
-        // Use shared (coherent) state with verbose faults so we can dump state correctly
-        let info = if debug_enabled(DebugFlags::VerboseFaults) {
-            &mut alloc.shared
-        } else {
-            &mut alloc.private
-        }
-        .new_init(
-            try_init!(QueueInfo::ver {
-                state: {
-                    state.with_mut(|raw, _inner| {
-                        raw.rb_size = size;
-                    });
-                    state
-                },
-                ring,
-                gpu_buf,
-                notifier_list: notifier_list,
-            }),
-            |inner, _p| {
-                try_init!(raw::QueueInfo::ver {
-                    state: inner.state.gpu_pointer(),
-                    ring: inner.ring.gpu_pointer(),
-                    notifier_list: inner.notifier_list.gpu_pointer(),
-                    gpu_buf: inner.gpu_buf.gpu_pointer(),
-                    gpu_rptr1: Default::default(),
-                    gpu_rptr2: Default::default(),
-                    gpu_rptr3: Default::default(),
-                    event_id: AtomicI32::new(-1),
-                    priority: prio,
-                    unk_4c: -1,
-                    uuid: id as u32,
-                    unk_54: -1,
-                    unk_58: Default::default(),
-                    busy: Default::default(),
-                    __pad: Default::default(),
-                    #[ver(V >= V13_2 && G < G14X)]
-                    unk_84_0: 0,
-                    unk_84_state: Default::default(),
-                    error_count: Default::default(),
-                    unk_8c: 0,
-                    unk_90: 0,
-                    unk_94: 0,
-                    pending: Default::default(),
-                    unk_9c: 0,
-                    gpu_context: gpu_context_pointer,
-                    unk_a8: Default::default(),
-                    #[ver(V >= V13_2 && G < G14X)]
-                    unk_b0: 0,
-                })
-            },
-        )?;
-
         let inner = WorkQueueInner::ver {
             dev: dev.into(),
             event_manager,
-            info: Some(KBox::new(info, GFP_KERNEL)?),
-            gpu_context,
+            // Use shared (coherent) state with verbose faults so we can dump state correctly
+            info: if debug_enabled(DebugFlags::VerboseFaults) {
+                &mut alloc.shared
+            } else {
+                &mut alloc.private
+            }
+            .new_init(
+                try_init!(QueueInfo::ver {
+                    state: {
+                        state.with_mut(|raw, _inner| {
+                            raw.rb_size = size;
+                        });
+                        state
+                    },
+                    ring,
+                    gpu_buf,
+                    notifier_list: notifier_list,
+                    gpu_context: gpu_context,
+                }),
+                |inner, _p| {
+                    try_init!(raw::QueueInfo::ver {
+                        state: inner.state.gpu_pointer(),
+                        ring: inner.ring.gpu_pointer(),
+                        notifier_list: inner.notifier_list.gpu_pointer(),
+                        gpu_buf: inner.gpu_buf.gpu_pointer(),
+                        gpu_rptr1: Default::default(),
+                        gpu_rptr2: Default::default(),
+                        gpu_rptr3: Default::default(),
+                        event_id: AtomicI32::new(-1),
+                        priority: prio,
+                        unk_4c: -1,
+                        uuid: id as u32,
+                        unk_54: -1,
+                        unk_58: Default::default(),
+                        busy: Default::default(),
+                        __pad: Default::default(),
+                        #[ver(V >= V13_2 && G < G14X)]
+                        unk_84_0: 0,
+                        unk_84_state: Default::default(),
+                        error_count: Default::default(),
+                        unk_8c: 0,
+                        unk_90: 0,
+                        unk_94: 0,
+                        pending: Default::default(),
+                        unk_9c: 0,
+                        gpu_context: inner.gpu_context.gpu_pointer(),
+                        unk_a8: Default::default(),
+                        #[ver(V >= V13_2 && G < G14X)]
+                        unk_b0: 0,
+                    })
+                },
+            )?,
             new: true,
             pipe_type,
             size,
@@ -823,7 +725,7 @@ impl WorkQueue::ver {
             last_submitted: None,
         };
 
-        let info_pointer = inner.info().weak_pointer();
+        let info_pointer = inner.info.weak_pointer();
 
         Arc::pin_init(
             pin_init!(Self {
@@ -907,7 +809,7 @@ impl WorkQueue::ver {
 
     pub(crate) fn dump_info(&self) {
         pr_info!("WorkQueue @ {:?}:", self.info_pointer);
-        self.inner.lock().info().with(|raw, _inner| {
+        self.inner.lock().info.with(|raw, _inner| {
             pr_info!("  GPU rptr1: {:#x}", raw.gpu_rptr1.load(Ordering::Relaxed));
             pr_info!("  GPU rptr1: {:#x}", raw.gpu_rptr2.load(Ordering::Relaxed));
             pr_info!("  GPU rptr1: {:#x}", raw.gpu_rptr3.load(Ordering::Relaxed));
@@ -1012,7 +914,7 @@ impl WorkQueue for WorkQueue::ver {
                 cmd.inner.gpu_va()
             );
             cmd.as_mut().inner_mut().complete();
-            workqueue::system_dfl().enqueue(cmd);
+            workqueue::system().enqueue(cmd);
         }
 
         mod_pr_debug!(
@@ -1025,7 +927,7 @@ impl WorkQueue for WorkQueue::ver {
         );
 
         inner
-            .info()
+            .info
             .state
             .with(|raw, _inner| raw.cpu_freeptr.store(last_wptr, Ordering::Release));
 

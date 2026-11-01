@@ -157,6 +157,8 @@ struct drm_file *drm_file_alloc(struct drm_minor *minor)
 	init_waitqueue_head(&file->event_wait);
 	file->event_space = 4096; /* set aside 4k for event buffer */
 
+	/* Shared file metadata also serves non-GEM syncobj waiters. */
+	spin_lock_init(&file->table_lock);
 	spin_lock_init(&file->master_lookup_lock);
 	mutex_init(&file->event_read_lock);
 	mutex_init(&file->client_name_lock);

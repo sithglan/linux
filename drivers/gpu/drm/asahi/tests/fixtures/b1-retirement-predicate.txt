@@ -1,0 +1,15 @@
+# Captured B1 gfx-text-9b110520.bin, file offsets 0x16a30..0x16a5b.
+# Image SHA256: cf352729699211decba77bea2499501b3df3b02665ac0a12316090e6cf5741fb
+# Decoded with aarch64-linux-gnu-objdump -D -b binary -m aarch64.
+# Instruction words are little-endian AArch64 words printed by objdump.
+fffffc0000016a30: 2941aea3 ldp w3, w11, [x21, #12]
+fffffc0000016a34: f94002a8 ldr x8, [x21]
+fffffc0000016a38: b9400109 ldr w9, [x8]
+fffffc0000016a3c: b94016aa ldr w10, [x21, #20]
+fffffc0000016a40: 6b0b015f cmp w10, w11
+fffffc0000016a44: 294332aa ldp w10, w12, [x21, #24]
+fffffc0000016a48: 7a4b3142 ccmp w10, w11, #0x2, cc
+fffffc0000016a4c: 7a493064 ccmp w3, w9, #0x4, cc
+fffffc0000016a50: 7a4b1182 ccmp w12, w11, #0x2, ne
+fffffc0000016a54: 1a9f37e9 cset w9, cs
+fffffc0000016a58: 2a090336 orr w22, w25, w9

@@ -15,7 +15,6 @@
 use kernel::{
     drm::mm,
     error::Result,
-    io::Io,
     prelude::*,
     str::CString, //
 };
@@ -23,8 +22,7 @@ use kernel::{
 use crate::debug::*;
 use crate::driver::{
     AsahiDevRef,
-    AsahiDevice,
-    AsahiDrmDevice, //
+    AsahiDevice, //
 };
 use crate::fw::types::Zeroable;
 use crate::mmu;
@@ -438,16 +436,13 @@ unsafe impl Sync for SimpleAllocation {}
 impl Drop for SimpleAllocation {
     fn drop(&mut self) {
         mod_dev_dbg!(
-            self.dev,
+            self.device(),
             "SimpleAllocator: drop object @ {:#x}\n",
             self.gpu_ptr()
         );
         if debug_enabled(DebugFlags::FillAllocations) {
-            let obj_size = self.obj.size();
-            if let Ok(vmap) = self.obj.vmap() {
-                for off in 0..obj_size {
-                    vmap.try_write8(0x42, off).unwrap();
-                }
+            if let Ok(mut vmap) = self.obj.vmap() {
+                vmap.memset(0x42);
             }
         }
     }
@@ -485,7 +480,7 @@ impl SimpleAllocator {
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        dev: &AsahiDrmDevice,
+        dev: &AsahiDevice,
         vm: &mmu::Vm,
         range: Range<u64>,
         min_align: usize,
@@ -536,14 +531,9 @@ impl Allocator for SimpleAllocator {
         );
 
         let mut obj = crate::gem::new_kernel_object(&self.dev, size_aligned)?;
-        let p = obj.vmap()?.addr as *mut u8;
+        let p = obj.vmap()?.as_mut_ptr() as *mut u8;
         if debug_enabled(DebugFlags::FillAllocations) {
-            let obj_size = obj.size();
-            if let Ok(vmap) = obj.vmap() {
-                for off in 0..obj_size {
-                    vmap.try_write8(0xde, off)?;
-                }
-            }
+            obj.vmap()?.memset(0xde);
         }
         let mapping = obj.map_into_range(
             &self.vm,
@@ -704,7 +694,7 @@ impl HeapAllocator {
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        dev: &AsahiDrmDevice,
+        dev: &AsahiDevice,
         vm: &mmu::Vm,
         range: Range<u64>,
         min_align: usize,
@@ -791,12 +781,7 @@ impl HeapAllocator {
 
         let mut obj = crate::gem::new_kernel_object(&self.dev, size_aligned)?;
         if self.cpu_maps && debug_enabled(DebugFlags::FillAllocations) {
-            let obj_size = obj.size();
-            if let Ok(vmap) = obj.vmap() {
-                for off in 0..obj_size {
-                    vmap.try_write8(0xde, off)?;
-                }
-            }
+            obj.vmap()?.memset(0xde);
         }
 
         let gpu_ptr = self.top;
@@ -912,7 +897,7 @@ impl HeapAllocator {
         let size_aligned = (size + align - 1) & !(align - 1);
 
         mod_dev_dbg!(
-            self.dev.as_ref(),
+            &self.dev,
             "HeapAllocator[{}]::new: size={:#x} size_al={:#x}\n",
             &*self.name,
             size,
@@ -935,7 +920,7 @@ impl HeapAllocator {
             Ok(a) => a,
             Err(a) => {
                 dev_err!(
-                    self.dev.as_ref(),
+                    &self.dev.as_ref(),
                     "HeapAllocator[{}]::new: Failed to insert node of size {:#x} / align {:#x}: {:?}\n",
                     &*self.name, size_aligned, align, a
                 );
@@ -990,7 +975,7 @@ impl HeapAllocator {
             let (obj_start, obj_size, p) = self.mm.with_inner(|inner| -> Result<_> {
                 let idx = idx.unwrap_or(inner.backing_objects.len() - 1);
                 let obj = &mut inner.backing_objects[idx];
-                let p = obj.0.vmap()?.addr as *mut u8;
+                let p = obj.0.vmap()?.as_mut_ptr() as *mut u8;
                 Ok((obj.2, obj.0.size(), p))
             })?;
             assert!(obj_start <= start);
@@ -1092,7 +1077,7 @@ impl Drop for HeapAllocatorInner {
         if self.allocated > 0 {
             // This should never happen
             dev_crit!(
-                self.dev.as_ref().as_ref(),
+                self.dev.as_ref(),
                 "HeapAllocator[{}]: dropping with {} bytes allocated\n",
                 &*self.name,
                 self.allocated

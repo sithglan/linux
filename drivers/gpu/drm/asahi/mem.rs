@@ -11,42 +11,11 @@
 use core::arch::asm;
 use core::cmp::min;
 
-use kernel::page::PAGE_SIZE;
-
 use crate::debug::*;
 use crate::mmu;
-use core::sync::atomic::{AtomicBool, Ordering};
+use kernel::page::PAGE_SIZE;
 
 type Asid = u8;
-
-/// Invalidate ranges page by page (`mmu::UatQuirks::page_tlbi`): never range operations.
-///
-/// The setting is global because the invalidation helpers take no UAT. It assumes one GPU per
-/// system: `Uat::new` sets it for that GPU before the GPU's first invalidation, and a second
-/// UAT with another policy would change it for both.
-static PAGE_TLBI: AtomicBool = AtomicBool::new(false);
-
-/// Ranges above this many pages are invalidated by ASID in page mode.
-const PAGE_TLBI_MAX_PAGES: usize = 2048;
-
-/// Selects page-by-page range invalidation for the system's GPU ([`PAGE_TLBI`]).
-pub(crate) fn set_page_tlbi(enabled: bool) {
-    PAGE_TLBI.store(enabled, Ordering::Relaxed);
-}
-
-/// Invalidates `len` bytes at `va` one 16 KiB page at a time, or the whole ASID above
-/// [`PAGE_TLBI_MAX_PAGES`].
-fn tlbi_pages(asid: Asid, va: usize, len: usize) {
-    let start = va >> mmu::UAT_PGBIT;
-    let end = (va + len + mmu::UAT_PGMSK) >> mmu::UAT_PGBIT;
-    if end - start > PAGE_TLBI_MAX_PAGES {
-        tlbi_asid(asid);
-        return;
-    }
-    for page in start..end {
-        tlbi_page(asid, page << mmu::UAT_PGBIT);
-    }
-}
 
 /// Invalidate the entire GPU TLB.
 #[inline(always)]
@@ -108,16 +77,11 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    if PAGE_TLBI.load(Ordering::Relaxed) {
-        tlbi_pages(asid, va, len);
-        return;
-    }
 
     let start_pg = va >> mmu::UAT_PGBIT;
     let end_pg = (va + len + mmu::UAT_PGMSK) >> mmu::UAT_PGBIT;
 
-    const BADDR_MASK: u64 = (1 << 37) - 1;
-    let mut val: u64 = (u64::from(asid) << 48) | (2 << 46) | (start_pg as u64 & BADDR_MASK);
+    let mut val: u64 = ((asid as u64) << 48) | (2 << 46) | (start_pg as u64 & 0x1fffffffff);
     let pages = end_pg - start_pg;
 
     // Guess? It's possible that the page count is in terms of 4K pages
@@ -135,14 +99,6 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     // base: 5 bits
     // exp: 2 bits
     // pages = (base + 1) << (5 * exp + 1)
-    // 0:00000 ->                     2 pages = 2 << 0
-    // 0:11111 ->                32 * 2 pages = 2 << 5
-    // 1:00000 ->            1 * 32 * 2 pages = 2 << 5
-    // 1:11111 ->           32 * 32 * 2 pages = 2 << 10
-    // 2:00000 ->       1 * 32 * 32 * 2 pages = 2 << 10
-    // 2:11111 ->      32 * 32 * 32 * 2 pages = 2 << 15
-    // 3:00000 ->  1 * 32 * 32 * 32 * 2 pages = 2 << 15
-    // 3:11111 -> 32 * 32 * 32 * 32 * 2 pages = 2 << 20
     let exp = min(3, (64 - num.leading_zeros()) / 5);
     let bits = 5 * exp;
     let mut base = (num + (1 << bits) - 1) >> bits;
@@ -159,10 +115,6 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
             );
         }
         base -= 32;
-        // Each full operation covers 32 units of 2 << bits GPU granules.
-        // Advance only the base-address field, preserving the ASID and scale.
-        let next = (val & BADDR_MASK) + (32u64 << (bits + 1));
-        val = (val & !BADDR_MASK) | (next & BADDR_MASK);
     }
 
     // SAFETY: tlbi is always safe by definition
@@ -175,23 +127,13 @@ pub(crate) fn tlbi_range(asid: Asid, va: usize, len: usize) {
     }
 }
 
-/// Range length from which [`tlbi_range_or_asid`] invalidates the whole ASID.
-const TLBI_RANGE_MAX: usize = 0x200_0000;
-/// Range length from which [`tlbi_range_or_asid`] counts in 1 MiB units (scale 1) instead of
-/// 32 KiB units (scale 0).
-const TLBI_RANGE_SCALE1_MIN: usize = 0x10_0000;
-/// Translation granule field value for 16 KiB pages.
-const TLBI_TG_16K: u64 = 2;
-/// Base address field of a range TLBI operand, bits 36:0. Bits 38:37 hold the TTL hint.
-const TLBI_RANGE_BADDR_MASK: u64 = (1 << 37) - 1;
-
-/// Invalidate a range of pages for a given ASID with a single range operation.
+/// Invalidate a T8140/G17P range using the native PI_300 producer's encoding.
 ///
-/// Unlike [`tlbi_range`], which issues as many range operations as needed, this invalidates
-/// ranges that do not fit one operation (and ranges starting at VA 0) by ASID. Single pages use a
-/// page operation, at the CPU page size.
+/// Keep this separate from `tlbi_range`: the legacy encoder is hardware-proven
+/// on already-conformant M1/M2 systems, while this formula is qualified only on
+/// T8140/G17P.
 #[inline(always)]
-pub(crate) fn tlbi_range_or_asid(asid: Asid, va: usize, len: usize) {
+pub(crate) fn tlbi_range_t8140(asid: Asid, va: usize, len: usize) {
     if debug_enabled(DebugFlags::ConservativeTlbi) {
         tlbi_all();
         sync();
@@ -201,12 +143,10 @@ pub(crate) fn tlbi_range_or_asid(asid: Asid, va: usize, len: usize) {
     if len == 0 {
         return;
     }
-    if PAGE_TLBI.load(Ordering::Relaxed) {
-        tlbi_pages(asid, va, len);
-        return;
-    }
 
-    if va == 0 || len >= TLBI_RANGE_MAX {
+    // The single-page decision follows the host CPU page size; range mode
+    // still uses the GPU's 16K granule (TG=2, BADDR=VA>>14).
+    if va == 0 || len >= 0x0200_0000 {
         tlbi_asid(asid);
         return;
     }
@@ -215,19 +155,22 @@ pub(crate) fn tlbi_range_or_asid(asid: Asid, va: usize, len: usize) {
         return;
     }
 
-    // The range covers (NUM + 1) << (5 * SCALE + 1) granules of 16 KiB.
-    let (scale, unit_shift) = if len >= TLBI_RANGE_SCALE1_MIN {
-        (1u64, 20)
+    let (scale, unit_shift) = if len >= 0x0010_0000 {
+        (1u64, 20usize)
     } else {
-        (0u64, 15)
+        (0u64, 15usize)
     };
-    let num = ((len - 1) >> unit_shift) as u64;
+    let count = ((len - 1) >> unit_shift) + 1;
+    let num = (count - 1) as u64;
+    debug_assert!(num <= 31);
 
-    let val = (u64::from(asid) << 48)
-        | (TLBI_TG_16K << 46)
+    // Native inserts VA[51:14] into operand[37:0]. Bit 37 is
+    // Apple/GPU-specific here; match the inspected PI_300 producer exactly.
+    let val = ((asid as u64) << 48)
+        | (2 << 46)
         | (scale << 44)
         | (num << 39)
-        | (((va >> mmu::UAT_PGBIT) as u64) & TLBI_RANGE_BADDR_MASK);
+        | (((va >> mmu::UAT_PGBIT) as u64) & 0x3fffffffff);
 
     // SAFETY: tlbi is always safe by definition
     unsafe {

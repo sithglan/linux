@@ -21,6 +21,8 @@ use core::ops::{
     DerefMut, //
 };
 use kernel::{
+    sync::CondVarTimeoutResult,
+    time::msecs_to_jiffies,
     error::{
         code::*,
         Result, //
@@ -120,6 +122,19 @@ struct SlotAllocatorInner<T: SlotItem> {
     get_count: u64,
     drop_count: u64,
     slot_limit: usize,
+    /// Hand out the lowest free slot index instead of the least recently
+    /// released one.
+    ///
+    /// The generic LRU exists to keep a returning user on the slot whose TLB
+    /// entries are still warm, and the `SlotToken` fast path already does
+    /// that. When a slot index *names a hardware resource* -- on T8140 each
+    /// UAT slot is one TTBAT context, and the render path encodes the bound
+    /// context into the fragment MCache selector -- LRU makes which context a
+    /// VM lands on depend on the whole allocation history. Lowest-first makes
+    /// the first binder deterministically take slot 0 (hardware context 1),
+    /// which is the context the measured first-partial opening contract pins
+    /// every one of its fields to.
+    lowest_first: bool,
 }
 
 /// A single slot allocator instance.
@@ -133,6 +148,11 @@ struct SlotAllocatorOuter<T: SlotItem> {
 
 /// A shared reference to a slot allocator instance.
 pub(crate) struct SlotAllocator<T: SlotItem>(Arc<SlotAllocatorOuter<T>>);
+
+/// How long a CONSTRAINED slot allocator waits for a slot before failing.
+/// Long enough for a client to exit and free one, short enough that a leaked
+/// binding produces an error instead of an unbounded block.
+const CONSTRAINED_SLOT_WAIT_MS: u32 = 2000;
 
 impl<T: SlotItem> SlotAllocator<T> {
     /// Creates a new `SlotAllocator`, with a fixed number of slots and arbitrary associated data.
@@ -169,6 +189,7 @@ impl<T: SlotItem> SlotAllocator<T> {
             get_count: 0,
             drop_count: 0,
             slot_limit: usize::MAX,
+            lowest_first: false,
         };
 
         let alloc = Arc::pin_init(
@@ -197,11 +218,27 @@ impl<T: SlotItem> SlotAllocator<T> {
         inner.slot_limit = limit.unwrap_or(NonZeroUsize::MAX).get();
     }
 
-    /// Gets a fresh slot, optionally reusing a previous allocation if a `SlotToken` is provided.
-    ///
-    /// Blocks if no slots are free.
-    pub(crate) fn get(&self, token: Option<SlotToken>) -> Result<Guard<T>> {
-        self.get_inner(token, |_a, _b| Ok(()))
+    /// Select the lowest free slot rather than the least recently released
+    /// one. See [`SlotAllocatorInner::lowest_first`].
+    pub(crate) fn set_lowest_first(&self, lowest_first: bool) {
+        let mut inner = self.0.inner.lock();
+        inner.lowest_first = lowest_first;
+    }
+
+    /// Snapshot which slots are currently checked out, as a bitmap over slot
+    /// indices. Diagnostics only: the answer is stale the moment it returns.
+    pub(crate) fn busy_mask(&self) -> u64 {
+        let inner = self.0.inner.lock();
+        let mut mask = 0u64;
+        for (i, slot) in inner.slots.iter().enumerate() {
+            if i >= 64 {
+                break;
+            }
+            if slot.is_none() {
+                mask |= 1u64 << i;
+            }
+        }
+        mask
     }
 
     /// Gets a fresh slot, optionally reusing a previous allocation if a `SlotToken` is provided.
@@ -241,33 +278,80 @@ impl<T: SlotItem> SlotAllocator<T> {
         let mut first = true;
         let slot = loop {
             let mut oldest_time = u64::MAX;
-            let mut oldest_slot = 0u32;
+            let mut found: Option<u32> = None;
+            let lowest_first = inner.lowest_first;
 
             for (i, slot) in inner.slots.iter().enumerate() {
                 if i >= inner.slot_limit {
                     break;
                 }
                 if let Some(slot) = slot.as_ref() {
+                    if lowest_first {
+                        found = Some(i as u32);
+                        break;
+                    }
                     if slot.drop_time < oldest_time {
-                        oldest_slot = i as u32;
+                        found = Some(i as u32);
                         oldest_time = slot.drop_time;
                     }
                 }
             }
 
-            if oldest_time == u64::MAX {
+            if found.is_none() {
                 if first && inner.slot_limit == usize::MAX {
                     pr_warn!(
                         "{}: out of slots, blocking\n",
                         core::any::type_name::<Self>()
                     );
                 }
+                // A CONSTRAINED allocator must not wait forever. T8140 sets
+                // slot_limit to 1, so if the single user slot is held by a
+                // binding that is never released -- which a render abandoned
+                // after a timeout does, since its abandon path deliberately
+                // frees nothing -- every later client blocks here for the life
+                // of the runtime. Measured: a compute submitted after a failed
+                // render sits in this wait for 42 seconds and only leaves when
+                // a signal arrives, failing -512 ERESTARTSYS from exactly the
+                // wait_interruptible below.
+                //
+                // Transient contention still resolves: a slot freed by a
+                // client exiting wakes the condvar well inside the bound.
+                // Exhausting it means the holder is not coming back, and
+                // EBUSY is the honest answer. The unlimited case, which every
+                // non-T8140 configuration uses, keeps the original
+                // indefinite wait.
+                if inner.slot_limit != usize::MAX {
+                    if first {
+                        pr_warn!(
+                            "{}: out of slots with a limit of {}, waiting up to {}ms\n",
+                            core::any::type_name::<Self>(),
+                            inner.slot_limit,
+                            CONSTRAINED_SLOT_WAIT_MS,
+                        );
+                    }
+                    first = false;
+                    match self.0.cond.wait_interruptible_timeout(
+                        &mut inner,
+                        msecs_to_jiffies(CONSTRAINED_SLOT_WAIT_MS),
+                    ) {
+                        CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                        CondVarTimeoutResult::Timeout => {
+                            pr_warn!(
+                                "{}: no slot freed within {}ms; failing with EBUSY rather than blocking\n",
+                                core::any::type_name::<Self>(),
+                                CONSTRAINED_SLOT_WAIT_MS,
+                            );
+                            return Err(EBUSY);
+                        }
+                        CondVarTimeoutResult::Woken { .. } => continue,
+                    }
+                }
                 first = false;
                 if self.0.cond.wait_interruptible(&mut inner) {
                     return Err(ERESTARTSYS);
                 }
             } else {
-                break oldest_slot;
+                break found.expect("checked above");
             }
         };
 

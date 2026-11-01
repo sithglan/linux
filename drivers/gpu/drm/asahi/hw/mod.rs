@@ -4,40 +4,19 @@
 //!
 //! This module contains the definitions used to store per-GPU and per-SoC configuration data.
 
+use crate::driver::AsahiDevice;
 use crate::fw::types::*;
+pub(crate) use crate::identity::{GpuGen, GpuHalGeneration, GpuVariant};
 use kernel::c_str;
-use kernel::device;
 use kernel::prelude::*;
 
 const MAX_POWERZONES: usize = 5;
 
+pub(crate) mod agx3;
 pub(crate) mod t600x;
 pub(crate) mod t602x;
-pub(crate) mod t6040;
 pub(crate) mod t8103;
 pub(crate) mod t8112;
-pub(crate) mod t8140;
-
-/// GPU generation enumeration. Note: Part of the UABI.
-#[derive(Debug, PartialEq, Copy, Clone)]
-#[repr(u32)]
-pub(crate) enum GpuGen {
-    G13 = 13,
-    G14 = 14,
-    G16 = 16,
-    G17 = 17,
-}
-
-/// GPU variant enumeration. Note: Part of the UABI.
-#[derive(Debug, PartialEq, Copy, Clone)]
-#[repr(u32)]
-pub(crate) enum GpuVariant {
-    P = 'P' as u32,
-    G = 'G' as u32,
-    S = 'S' as u32,
-    C = 'C' as u32,
-    D = 'D' as u32,
-}
 
 /// GPU revision enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -52,7 +31,7 @@ pub(crate) enum GpuRevision {
 }
 
 /// GPU core type enumeration. Note: Part of the firmware ABI.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(u32)]
 pub(crate) enum GpuCore {
     // Unknown = 0,
@@ -209,14 +188,18 @@ pub(crate) struct HwConfig {
     /// GPU variant type.
     pub(crate) gpu_variant: GpuVariant,
     /// GPU core type ID (as known by the firmware).
-    pub(crate) gpu_core: GpuCore,
+    ///
+    /// This is a firmware-ABI value (renumbered per firmware build). It is
+    /// `None` where no firmware GpuCore id has been recovered (AGX3 parts):
+    /// consumers must fail closed rather than substitute a number.
+    pub(crate) gpu_core: Option<GpuCore>,
 
     /// Base clock used used for timekeeping.
     pub(crate) base_clock_hz: u32,
-    /// Input address bits translated by each UAT page table root on this SoC.
-    pub(crate) uat_ias: u32,
     /// Output address space for the UAT on this SoC.
     pub(crate) uat_oas: u32,
+    /// Input-address bits translated by each UAT root.
+    pub(crate) uat_ias: u8,
     /// Number of dies on this SoC.
     pub(crate) num_dies: u32,
     /// Maximum number of clusters on this SoC.
@@ -322,10 +305,16 @@ pub(crate) struct GpuIdConfig {
     pub(crate) gpu_gen: GpuGen,
     /// GPU variant type (should match static config).
     pub(crate) gpu_variant: GpuVariant,
+    /// Unified shader core generation.
+    pub(crate) usc_generation: u32,
+    /// Apple GPU HAL generation (0 for the pre-numbered generations).
+    pub(crate) gpu_hal_generation: GpuHalGeneration,
     /// GPU silicon revision.
     pub(crate) gpu_rev: GpuRevision,
     /// GPU silicon revision ID (firmware enum).
     pub(crate) gpu_rev_id: GpuRevisionID,
+    /// Number of GPU dies read from the ID register.
+    pub(crate) num_dies: u32,
     /// Total number of GPU clusters.
     pub(crate) num_clusters: u32,
     /// Maximum number of GPU cores per cluster.
@@ -340,6 +329,14 @@ pub(crate) struct GpuIdConfig {
     pub(crate) core_masks: KVec<u32>,
     /// Packed mask of all active cores.
     pub(crate) core_masks_packed: KVec<u32>,
+    /// GPC performance-state map nibble sampled during the safe SGX ID probe.
+    /// G17P emits this cached high nibble in fragment register 0x1c838. The
+    /// 3D descriptor tail at +0x2110 has an independent render-setup source.
+    pub(crate) gpc_perf_state_map: u32,
+    /// Low nibble of the same SGX 0xe01480 word, written to 3D tail +0x210c.
+    pub(crate) gpc_perf_state_map_low: u32,
+    /// Bit 0 of SGX 0xe0141c, written to 3D tail +0x2104.
+    pub(crate) gpc_perf_state_control: u32,
 }
 
 /// Configurable CS/AFR GPU power settings from the device tree.
@@ -464,7 +461,7 @@ pub(crate) struct PwrConfig {
 
 impl PwrConfig {
     fn load_opp(
-        dev: &device::Device,
+        dev: &AsahiDevice,
         name: &CStr,
         cfg: &HwConfig,
         is_main: bool,
@@ -491,7 +488,7 @@ impl PwrConfig {
 
             if volt_uv.len() != voltage_count as usize {
                 dev_err!(
-                    dev,
+                    dev.as_ref(),
                     "Invalid opp-microvolt length (expected {}, got {})\n",
                     voltage_count,
                     volt_uv.len()
@@ -522,22 +519,22 @@ impl PwrConfig {
     }
 
     /// Load the GPU power configuration from the device tree.
-    pub(crate) fn load(dev: &device::Device, cfg: &HwConfig) -> Result<PwrConfig> {
+    pub(crate) fn load(dev: &AsahiDevice, cfg: &HwConfig) -> Result<PwrConfig> {
         let perf_states = Self::load_opp(dev, c_str!("operating-points-v2"), cfg, true)?;
-        let node = dev.of_node().ok_or(EIO)?;
+        let node = dev.as_ref().of_node().ok_or(EIO)?;
 
         macro_rules! prop {
             ($prop:expr, $default:expr) => {{
                 node.get_opt_property(c_str!($prop))
                     .map_err(|e| {
-                        dev_err!(dev, "Error reading property {}: {:?}\n", $prop, e);
+                        dev_err!(dev.as_ref(), "Error reading property {}: {:?}\n", $prop, e);
                         e
                     })?
                     .unwrap_or($default)
             }};
             ($prop:expr) => {{
                 node.get_property(c_str!($prop)).map_err(|e| {
-                    dev_err!(dev, "Error reading property {}: {:?}\n", $prop, e);
+                    dev_err!(dev.as_ref(), "Error reading property {}: {:?}\n", $prop, e);
                     e
                 })?
             }};
@@ -546,17 +543,18 @@ impl PwrConfig {
         let pz_data = prop!("apple,power-zones", KVec::new());
 
         if pz_data.len() > 3 * MAX_POWERZONES || pz_data.len() % 3 != 0 {
-            dev_err!(dev, "Invalid apple,power-zones value\n");
+            dev_err!(dev.as_ref(), "Invalid apple,power-zones value\n");
             return Err(EINVAL);
         }
 
+        let pz_count = pz_data.len() / 3;
         let mut power_zones = KVec::new();
-        for zone in pz_data.chunks_exact(3) {
+        for i in (0..pz_count).step_by(3) {
             power_zones.push(
                 PowerZone {
-                    target: zone[0],
-                    target_offset: zone[1],
-                    filter_tc: zone[2],
+                    target: pz_data[i],
+                    target_offset: pz_data[i + 1],
+                    filter_tc: pz_data[i + 2],
                 },
                 GFP_KERNEL,
             )?;
@@ -566,11 +564,11 @@ impl PwrConfig {
         let sram_leak_coef: KVec<F32> = prop!("apple,sram-leak-coef");
 
         if core_leak_coef.len() != cfg.max_num_clusters as usize {
-            dev_err!(dev, "Invalid apple,core-leak-coef\n");
+            dev_err!(dev.as_ref(), "Invalid apple,core-leak-coef\n");
             return Err(EINVAL);
         }
         if sram_leak_coef.len() != cfg.max_num_clusters as usize {
-            dev_err!(dev, "Invalid apple,sram_leak_coef\n");
+            dev_err!(dev.as_ref(), "Invalid apple,sram_leak_coef\n");
             return Err(EINVAL);
         }
 
