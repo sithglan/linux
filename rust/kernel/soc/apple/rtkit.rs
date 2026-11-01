@@ -5,6 +5,8 @@
 //! C header: [`include/linux/soc/apple/rtkit.h`](../../../../include/linux/gpio/driver.h)
 
 use crate::{
+    io::register,
+    alloc::flags::*,
     bindings,
     device,
     error::{
@@ -12,12 +14,7 @@ use crate::{
         from_result,
         to_result, //
     },
-    io::{
-        register,
-        Io,
-        IoSysMap,
-        Region, //
-    },
+    iosys_map::IoSysMapRef,
     prelude::*,
     str::CStrExt,
     types::{
@@ -48,7 +45,7 @@ pub trait Buffer {
 
     /// Returns a mutable byte slice of the buffer contents, or an
     /// error if unavailable.
-    fn buf(&mut self) -> Result<IoSysMap<'_, Region>>;
+    fn buf(&mut self) -> Result<IoSysMapRef<'_, u8>>;
 }
 
 /// Callback operations for an RTKit client.
@@ -181,16 +178,18 @@ unsafe extern "C" fn shmem_setup_callback<T: Operations>(
         };
 
         let iova = buf.iova()?;
-        let IoSysMap::Sys(sysmem) = buf.buf()? else {
-            return Err(EINVAL);
-        };
+        let iosys_map = buf.buf()?;
 
-        if sysmem.size() < bfr_mut.size {
+        // The C transport accesses this pointer as normal system memory.
+        if iosys_map.is_iomem() {
+            return Err(EINVAL);
+        }
+        if iosys_map.size() < bfr_mut.size {
             return Err(ENOMEM);
         }
 
         bfr_mut.iova = iova as u64;
-        bfr_mut.buffer = sysmem.as_ptr() as *mut _;
+        bfr_mut.buffer = iosys_map.as_mut_ptr() as *mut _;
 
         // Now box the returned buffer type and stash it in the private pointer of the
         // `apple_rtkit_shmem` struct for safekeeping.
@@ -222,7 +221,6 @@ impl<T: Operations> RtKit<T> {
         } else {
             0
         },
-        syslog_is_debug: None,
         crashed: Some(crashed_callback::<T>),
         recv_message: Some(recv_message_callback::<T>),
         recv_message_early: Some(recv_message_early_callback::<T>),
@@ -231,18 +229,11 @@ impl<T: Operations> RtKit<T> {
         } else {
             None
         },
-        shmem_setup_ep: None,
         shmem_destroy: if T::HAS_SHMEM_ALLOC || T::HAS_SHMEM_MAP {
             Some(shmem_destroy_callback::<T>)
         } else {
             None
         },
-        protocol_version: 0,
-    };
-
-    const COREANALYTICS_VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
-        flags: Self::VTABLE.flags | bindings::APPLE_RTKIT_NEEDS_COREANALYTICS,
-        ..Self::VTABLE
     };
 
     /// Creates a new RTKit client for a given device and optional mailbox name or index.
@@ -252,47 +243,48 @@ impl<T: Operations> RtKit<T> {
         mbox_idx: usize,
         data: T::Data,
     ) -> Result<Self> {
-        Self::new_with_ops(dev, mbox_name, mbox_idx, data, &Self::VTABLE)
+        Self::new_inner(dev, mbox_name, mbox_idx, data, false)
     }
 
-    /// Creates a client that requires CoreAnalytics setup during boot.
-    ///
-    /// The caller must qualify this dependency for the particular firmware
-    /// instance. This selects immutable operations before mailbox RX starts.
-    pub fn new_with_coreanalytics(
+    /// Creates a G17P client whose crash DVA belongs to the GPU UAT.
+    pub fn new_g17p(
         dev: &device::Device,
         mbox_name: Option<&'static CStr>,
         mbox_idx: usize,
         data: T::Data,
     ) -> Result<Self> {
-        Self::new_with_ops(dev, mbox_name, mbox_idx, data, &Self::COREANALYTICS_VTABLE)
+        Self::new_inner(dev, mbox_name, mbox_idx, data, true)
     }
 
-    fn new_with_ops(
+    fn new_inner(
         dev: &device::Device,
         mbox_name: Option<&'static CStr>,
         mbox_idx: usize,
         data: T::Data,
-        ops: &'static bindings::apple_rtkit_ops,
+        firmware_owned_crashlog: bool,
     ) -> Result<Self> {
         let ptr: *mut crate::ffi::c_void = data.into_foreign().cast();
         let guard = ScopeGuard::new(|| {
             // SAFETY: `ptr` came from a previous call to `into_foreign`.
             unsafe { T::Data::from_foreign(ptr.cast()) };
         });
-        // SAFETY: `dev` is valid by its type invarants and otherwise his just
-        //          calls the C init function.
+        let name = match mbox_name {
+            Some(s) => s.as_char_ptr(),
+            None => ptr::null(),
+        };
+        let index = mbox_idx.try_into()?;
+        // SAFETY: `dev` is valid by its type invariant and both C initializers
+        // take the same borrowed pointers. The guard owns `ptr` on failure.
         let rtk = unsafe {
-            from_err_ptr(bindings::apple_rtkit_init(
-                dev.as_raw(),
-                ptr,
-                match mbox_name {
-                    Some(s) => s.as_char_ptr(),
-                    None => ptr::null(),
-                },
-                mbox_idx.try_into()?,
-                ops,
-            ))
+            if firmware_owned_crashlog {
+                from_err_ptr(bindings::apple_rtkit_init_g17p(
+                    dev.as_raw(), ptr, name, index, &Self::VTABLE,
+                ))
+            } else {
+                from_err_ptr(bindings::apple_rtkit_init(
+                    dev.as_raw(), ptr, name, index, &Self::VTABLE,
+                ))
+            }
         }?;
 
         guard.dismiss();
@@ -356,57 +348,6 @@ impl<T: Operations> RtKit<T> {
     /// Checks if an endpoint is present
     pub fn has_endpoint(self: Pin<&mut Self>, endpoint: u8) -> bool {
         unsafe { bindings::apple_rtkit_has_endpoint(self.rtk, endpoint) }
-    }
-
-    /// Sets the minimum utilization (0..=1024) the coprocessor's receive thread runs with, or
-    /// restores the scheduler's default with `None`.
-    ///
-    /// The receive thread applies it to itself when it next runs. Returns `EOPNOTSUPP` for a
-    /// mailbox without a threaded receive handler.
-    pub fn set_rx_util_min(&self, util_min: Option<u32>) -> Result {
-        // INVARIANT: `rtk` is valid per the type invariant.
-        RxUtilMin { rtk: self.rtk }.set(util_min)
-    }
-
-    /// Returns a handle that sets the receive thread's minimum utilization (see
-    /// [`RtKit::set_rx_util_min`]) without borrowing this [`RtKit`], from any context.
-    ///
-    /// # Safety
-    ///
-    /// The caller must not use the handle after this [`RtKit`] is dropped.
-    pub unsafe fn rx_util_min_handle(&self) -> RxUtilMin {
-        // INVARIANT: The caller keeps this `RtKit`, and so `rtk`, alive while using the handle.
-        RxUtilMin { rtk: self.rtk }
-    }
-}
-
-/// Sets the minimum utilization of an RTKit coprocessor's receive thread.
-///
-/// The request is a single store that the receive thread applies to itself when it next runs,
-/// so it may be made from any context.
-///
-/// # Invariants
-///
-/// `rtk` is valid while the handle is used.
-#[derive(Clone, Copy)]
-pub struct RxUtilMin {
-    rtk: *mut bindings::apple_rtkit,
-}
-
-// SAFETY: The request is one store into the mailbox, valid from any thread.
-unsafe impl Send for RxUtilMin {}
-// SAFETY: As above; the handle has no state of its own.
-unsafe impl Sync for RxUtilMin {}
-
-impl RxUtilMin {
-    /// See [`RtKit::set_rx_util_min`].
-    pub fn set(&self, util_min: Option<u32>) -> Result {
-        let util_min = match util_min {
-            Some(v) => i32::try_from(v).map_err(|_| EINVAL)?,
-            None => -1,
-        };
-        // SAFETY: `rtk` is valid per the type invariant; the call only stores the request.
-        to_result(unsafe { bindings::apple_rtkit_set_rx_util_min(self.rtk, util_min) })
     }
 }
 

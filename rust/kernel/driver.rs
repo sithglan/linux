@@ -121,12 +121,12 @@ use crate::{
 /// # Safety
 ///
 /// Implementors must guarantee that:
-/// - `DriverType` is `repr(C)`,
+/// - `DriverType` is `repr(C)` and valid when all its bytes are zero,
 /// - `DriverData` is the type of the driver's device private data.
 /// - `DriverType` embeds a valid `struct device_driver` at byte offset `DEVICE_DRIVER_OFFSET`.
 pub unsafe trait DriverLayout {
     /// The specific driver type embedding a `struct device_driver`.
-    type DriverType: Default;
+    type DriverType;
 
     /// The type of the driver's bus device private data.
     type DriverData<'bound>;
@@ -231,8 +231,12 @@ impl<T: RegistrationOps> Registration<T> {
     {
         try_pin_init!(Self {
             reg <- Opaque::try_ffi_init(|ptr: *mut T::DriverType| {
-                // SAFETY: `try_ffi_init` guarantees that `ptr` is valid for write.
-                unsafe { ptr.write(T::DriverType::default()) };
+                // SAFETY: `try_ffi_init` guarantees that `ptr` is valid for write, and
+                // `DriverLayout` requires an all-zero `DriverType` to be valid.  Avoid
+                // calling the bindgen `Default` implementation here: modules instantiate
+                // this generic code outside the kernel crate, while those generated trait
+                // methods are not exported to loadable modules.
+                unsafe { ptr.write_bytes(0, 1) };
 
                 // SAFETY: `try_ffi_init` guarantees that `ptr` is valid for write, and it has
                 // just been initialised above, so it's also valid for read.
