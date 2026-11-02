@@ -20,6 +20,7 @@ static struct apple_isp *isp_test_alloc(struct kunit *test)
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, isp);
 
 	mutex_init(&isp->video_lock);
+	mutex_init(&isp->cmd_lock);
 	spin_lock_init(&isp->buf_lock);
 	INIT_LIST_HEAD(&isp->bufs_returned);
 	isp_get_current_format(isp)->total_size = ISP_TEST_FRAME_SIZE;

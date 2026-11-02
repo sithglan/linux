@@ -370,6 +370,7 @@ struct apple_isp {
 	wait_queue_head_t wait;
 	dma_addr_t cmd_iova;
 	void *cmd_virt;
+	struct mutex cmd_lock; /* the command area, for commands and buffer batches */
 	dma_addr_t ipc_boot_iova;
 	size_t ipc_boot_size;
 

@@ -196,6 +196,8 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 	struct isp_buflist *bl = isp->cmd_virt;
 	struct isp_buflist_buffer *bufd = &bl->buffers[0];
 
+	guard(mutex)(&isp->cmd_lock);
+
 	/* Before the command area is overwritten */
 	err = isp_ipc_resync(isp);
 	if (err)
