@@ -14,7 +14,6 @@
 #include <linux/pm_runtime.h>
 #include <linux/workqueue.h>
 
-#include "isp-awb.h"
 #include "isp-cam.h"
 #include "isp-fw.h"
 #include "isp-iommu.h"
@@ -548,8 +547,6 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto detach_genpd;
 	}
 
-	apple_isp_awb_init(isp);
-
 	err = apple_isp_init_iommu(isp);
 	if (err) {
 		dev_err(dev, "failed to init iommu: %d\n", err);
@@ -947,11 +944,6 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.resident_fw = true,
 	/* The J813 IMX958 runs the xx24 setfile 2224_01, as T6040 does. */
 	.setfile_stride_fixup = true,
-	/*
-	 * Its AWB is the semantic one, on the neural engine; without that,
-	 * white balance comes from the host (isp-awb.c).
-	 */
-	.host_awb = true,
 };
 
 static const struct of_device_id apple_isp_of_match[] = {

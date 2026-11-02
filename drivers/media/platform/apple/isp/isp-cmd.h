@@ -75,10 +75,6 @@
 #define CISP_CMD_CH_PREVIEW_STREAM_SET			     0x0b0d
 #define CISP_CMD_CH_SEMANTIC_VIDEO_ENABLE		     0x0b17
 #define CISP_CMD_CH_SEMANTIC_AWB_ENABLE			     0x0b18
-/* AWB: the firmware stores the names in opcode order (CISP_CMD_CH_AWB_START = 0x300) */
-#define CISP_CMD_CH_AWB_CCT_MANUAL			     0x0305
-#define CISP_CMD_CH_AWB_MANUAL_WB_GAIN_SET		     0x0312
-#define CISP_CMD_APPLE_CH_AWB_SCHEME_SET		     0x8305
 #define CISP_CMD_CH_FACE_DETECTION_START		     0x0d00
 #define CISP_CMD_CH_FACE_DETECTION_STOP			     0x0d01
 #define CISP_CMD_CH_FACE_DETECTION_CONFIG_GET		     0x0d02
@@ -780,8 +776,5 @@ static_assert(sizeof(struct cmd_ch_semantic_awb_enable) == 0x10);
 int isp_cmd_ch_semantic_video_enable(struct apple_isp *isp, u32 chan,
 				     u32 enable);
 int isp_cmd_ch_semantic_awb_enable(struct apple_isp *isp, u32 chan, u32 enable);
-int isp_cmd_ch_awb_scheme_set(struct apple_isp *isp, u32 chan, u32 scheme);
-int isp_cmd_ch_awb_cct_manual(struct apple_isp *isp, u32 chan, u32 cct);
-int isp_cmd_ch_awb_manual_wb_gain_set(struct apple_isp *isp, u32 chan, u32 r, u32 g, u32 b);
 
 #endif /* __ISP_CMD_H__ */
