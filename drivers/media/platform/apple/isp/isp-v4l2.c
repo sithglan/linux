@@ -12,6 +12,7 @@
 #include <media/v4l2-mc.h>
 #include <media/videobuf2-dma-sg.h>
 
+#include "isp-awb.h"
 #include "isp-cam.h"
 #include "isp-cmd.h"
 #include "isp-iommu.h"
@@ -155,8 +156,10 @@ int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan)
 					buf->vb.sequence = isp->sequence++;
 					buf->vb.field = V4L2_FIELD_NONE;
 					if (req->arg2 ==
-					    ISP_IPC_BUFEXC_FLAG_RENDER)
+					    ISP_IPC_BUFEXC_FLAG_RENDER) {
 						state = VB2_BUF_STATE_DONE;
+						apple_isp_awb_frame(isp, buf);
+					}
 					if (isp_is_p010(isp)) {
 						buf->return_state = state;
 						list_move_tail(&buf->link, &isp->bufs_returned);

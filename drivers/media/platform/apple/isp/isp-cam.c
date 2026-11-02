@@ -4,6 +4,7 @@
 #include <linux/firmware.h>
 #include <linux/unaligned.h>
 
+#include "isp-awb.h"
 #include "isp-cam.h"
 #include "isp-cmd.h"
 #include "isp-fw.h"
@@ -737,6 +738,11 @@ select_config:
 	if (err)
 		return err;
 
+	/* White balance from the host where the firmware's AWB needs the ANE */
+	err = apple_isp_awb_start(isp, ch);
+	if (err)
+		dev_warn(isp->dev, "host white balance not enabled: %d\n", err);
+
 	if (h17)
 		return isp_cmd_ch_master_slave_sync_mode_set(isp, ch, 0);
 
@@ -770,6 +776,8 @@ int apple_isp_start_camera(struct apple_isp *isp)
 
 void apple_isp_stop_camera(struct apple_isp *isp)
 {
+	apple_isp_awb_stop(isp);
+
 	/*
 	 * A timed-out request is resolved before anything the firmware may
 	 * still use for it is released. Firmware that does not answer even
@@ -850,6 +858,8 @@ int apple_isp_start_capture(struct apple_isp *isp)
 
 void apple_isp_stop_capture(struct apple_isp *isp)
 {
+	/* The white balance work must not send a command beside the stop. */
+	apple_isp_awb_stop(isp);
 	if (isp->ipc_failed || isp->fw_state == ISP_FW_DEAD)
 		return;
 	isp_cmd_ch_stop(isp, 0); // TODO channel mask

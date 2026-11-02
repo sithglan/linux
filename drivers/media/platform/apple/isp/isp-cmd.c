@@ -732,6 +732,51 @@ int isp_cmd_ch_semantic_awb_enable(struct apple_isp *isp, u32 chan, u32 enable)
 	return CISP_SEND_IN(isp, args);
 }
 
+int isp_cmd_ch_awb_scheme_set(struct apple_isp *isp, u32 chan, u32 scheme)
+{
+	struct {
+		u64 opcode;
+		u32 chan;
+		u32 scheme;
+	} __packed args = {
+		.opcode = CISP_OPCODE(CISP_CMD_APPLE_CH_AWB_SCHEME_SET),
+		.chan = chan,
+		.scheme = scheme,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+int isp_cmd_ch_awb_cct_manual(struct apple_isp *isp, u32 chan, u32 cct)
+{
+	struct {
+		u64 opcode;
+		u32 chan;
+		u32 cct;
+		u32 tag;
+	} __packed args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_AWB_CCT_MANUAL),
+		.chan = chan,
+		.cct = cct,
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
+/* Gains in 1/4096 (0x1000 = 1.0), applied before the colour matrix. */
+int isp_cmd_ch_awb_manual_wb_gain_set(struct apple_isp *isp, u32 chan, u32 r, u32 g, u32 b)
+{
+	struct {
+		u64 opcode;
+		u32 chan;
+		u32 gain[3];
+		u32 tag;
+	} __packed args = {
+		.opcode = CISP_OPCODE(CISP_CMD_CH_AWB_MANUAL_WB_GAIN_SET),
+		.chan = chan,
+		.gain = { r, g, b },
+	};
+	return CISP_SEND_IN(isp, args);
+}
+
 int isp_cmd_ch_lpdp_hs_receiver_tuning_set(struct apple_isp *isp, u32 chan, u32 unk1, u32 unk2)
 {
 	struct cmd_ch_lpdp_hs_receiver_tuning_set args = {

@@ -149,6 +149,11 @@ struct isp_preset {
 
 struct apple_isp_hw {
 	enum isp_generation gen;
+	/*
+	 * The firmware's AWB needs the neural engine: run it on the host with
+	 * manual gains instead (isp-awb.c).
+	 */
+	bool host_awb;
 	enum isp_fw_abi fw_abi;
 	u64 pmu_base;
 
@@ -271,6 +276,19 @@ struct isp_sensor_config {
 	u8 reply[ISP_SENSOR_CONFIG_SIZE];
 };
 
+/* Host white balance state (isp-awb.c). */
+struct isp_awb {
+	struct work_struct work;
+	spinlock_t lock;	/* protects @sum and @n */
+	u64 sum[3];
+	u32 n;
+	u32 frames;
+	u32 gain[3];
+	u32 chan;
+	bool active;
+	bool setup;	/* scheme, colour temperature and first gains still to send */
+};
+
 struct isp_format {
 	enum isp_sensor_id id;
 	u32 version;
@@ -288,6 +306,8 @@ struct apple_isp {
 	enum isp_firmware_version fw_compat;
 	u32 platform_id;
 	u32 temporal_filter;
+
+	struct isp_awb awb;
 	u32 cam_connections_scheme;
 	struct isp_preset *presets;
 	int num_presets;
