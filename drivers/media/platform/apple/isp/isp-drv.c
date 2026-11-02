@@ -531,7 +531,6 @@ static int apple_isp_probe(struct platform_device *pdev)
 	}
 
 	mutex_init(&isp->video_lock);
-	mutex_init(&isp->cmd_lock);
 	spin_lock_init(&isp->buf_lock);
 	init_waitqueue_head(&isp->wait);
 	INIT_LIST_HEAD(&isp->gc);

@@ -22,8 +22,7 @@
 #define CISP_POST_IN(x, a)    (isp_cmd_send((x), &(a), sizeof(a), 0, 0))
 #define CISP_POST_INOUT(x, a)    (isp_cmd_send((x), &(a), sizeof(a), sizeof(a), 0))
 
-static int __isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize,
-			  int timeout)
+int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize, int timeout)
 {
 	struct isp_channel *chan;
 	struct isp_message *req;
@@ -70,23 +69,11 @@ static int __isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 out
 	return err;
 }
 
-/*
- * One user of the command area at a time: the commands and the buffer
- * batches (isp_submit_buffers()) share it.
- */
-int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize, int timeout)
-{
-	guard(mutex)(&isp->cmd_lock);
-	return __isp_cmd_send(isp, args, insize, outsize, timeout);
-}
-
 static int cisp_send_read(struct apple_isp *isp, void *args, u32 insize,
 			  u32 outsize)
 {
-	int err;
-
-	guard(mutex)(&isp->cmd_lock);
-	err = __isp_cmd_send(isp, args, insize, outsize, CISP_TIMEOUT);
+	/* TODO do I need to lock the iova space? */
+	int err = isp_cmd_send(isp, args, insize, outsize, CISP_TIMEOUT);
 	if (err)
 		return err;
 

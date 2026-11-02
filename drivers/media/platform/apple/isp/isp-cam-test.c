@@ -112,7 +112,6 @@ static struct apple_isp *isp_test_capture_alloc(struct kunit *test)
 	int err;
 
 	KUNIT_ASSERT_NOT_NULL(test, isp);
-	mutex_init(&isp->cmd_lock);
 	isp->dev = kunit_device_register(test, "apple-isp-camera-test");
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, isp->dev);
 	isp->hw = &hw;
